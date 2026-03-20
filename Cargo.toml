@@ -19,6 +19,7 @@ thiserror = "2"
 dotenv = "0.15"
 futures-util = "0.3"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", features = ["ring"] }
 url = "2"
 dashmap = "6"
 tokio-util = "0.7"
@@ -26,3 +27,5 @@ tracing-appender = "0.2"
 ecdsa = "0.16"
 k256 = "0.13"
 alloy = { version = "1.7", features = ["provider-http", "contract", "sol-types"] }
+ratatui = "0.29"
+crossterm = "0.28"

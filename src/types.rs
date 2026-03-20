@@ -101,6 +101,7 @@ pub struct SpotState {
     pub price: Decimal,
     pub timestamp: DateTime<Utc>,
     pub opening_price: Option<Decimal>,
+    #[allow(dead_code)]
     pub opening_timestamp: Option<DateTime<Utc>>,
 }
 
@@ -114,14 +115,17 @@ impl SpotState {
 #[derive(Debug, Clone)]
 pub struct OrderbookLevel {
     pub price: Decimal,
+    #[allow(dead_code)]
     pub size: Decimal,
 }
 
 #[derive(Debug, Clone)]
 pub struct OrderbookState {
+    #[allow(dead_code)]
     pub token_id: String,
     pub bids: Vec<OrderbookLevel>,
     pub asks: Vec<OrderbookLevel>,
+    #[allow(dead_code)]
     pub timestamp: DateTime<Utc>,
 }
 
@@ -142,6 +146,7 @@ impl OrderbookState {
         self.bids.first().map(|l| l.price)
     }
 
+    #[allow(dead_code)]
     pub fn best_ask(&self) -> Option<Decimal> {
         self.asks.first().map(|l| l.price)
     }
@@ -175,6 +180,7 @@ impl PairCost {
         }
     }
 
+    #[allow(dead_code)]
     pub fn imbalance_pct(&self) -> Decimal {
         let max_qty = self.yes_qty.max(self.no_qty);
         if max_qty <= Decimal::ZERO {
@@ -200,6 +206,7 @@ impl InventoryState {
         }
     }
 
+    #[allow(dead_code)]
     pub fn total_shares(&self) -> Decimal {
         self.yes_shares + self.no_shares
     }
@@ -217,16 +224,23 @@ pub struct Position {
 #[derive(Debug, Clone)]
 pub struct OrderState {
     pub order_id: String,
+    #[allow(dead_code)]
     pub token_id: String,
+    #[allow(dead_code)]
     pub side: String, // "BUY" or "SELL"
+    #[allow(dead_code)]
     pub price: Decimal,
+    #[allow(dead_code)]
     pub size: Decimal,
+    #[allow(dead_code)]
     pub filled: Decimal,
     pub status: String, // "OPEN", "FILLED", "CANCELLED"
+    #[allow(dead_code)]
     pub placed_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct TradeResult {
     pub round_start: i64,
     pub coin: String,
@@ -259,6 +273,7 @@ impl BotState {
         }
     }
 
+    #[allow(dead_code)]
     pub fn inventory_key(coin: Coin, period: Period, round_start: i64) -> String {
         format!("{:?}_{:?}_{}", coin, period, round_start)
     }
@@ -266,8 +281,11 @@ impl BotState {
 
 #[derive(Debug, Clone)]
 pub struct FeeRate {
+    #[allow(dead_code)]
     pub token_id: String,
+    #[allow(dead_code)]
     pub fee_rate_bps: u64,
+    #[allow(dead_code)]
     pub fetched_at: DateTime<Utc>,
 }
 
@@ -276,4 +294,95 @@ impl FeeRate {
         let age = (Utc::now() - self.fetched_at).num_seconds() as u64;
         age > max_age_secs
     }
+}
+
+// ---- TUI dashboard state and events ----
+
+/// Events sent from bot modules to the TUI over a single mpsc channel.
+#[derive(Debug, Clone)]
+pub enum TuiEvent {
+    BalanceUpdate(Decimal),
+    RoundUpdate {
+        coin: Coin,
+        period: Period,
+        round_start: i64,
+        elapsed_pct: f64,
+        yes_price: Decimal,
+        no_price: Decimal,
+        strategy: String,
+        status: String,
+    },
+    #[allow(dead_code)]
+    SpreadUpdate {
+        round_key: String,
+        pair_cost: Decimal,
+        imbalance_pct: f64,
+        est_profit: Decimal,
+    },
+    /// Formatted log line for the trade log panel.
+    TradeLog(String),
+    /// Cumulative P&L (e.g. daily).
+    PnlUpdate(Decimal),
+    /// Session stats: trades count, rounds count, win rate, uptime, rebates, pnl_pct, etc.
+    SessionStats {
+        trades: u64,
+        rounds: u64,
+        win_rate_pct: f64,
+        pnl_pct: f64,
+        uptime_secs: u64,
+        avg_pair_cost: Option<Decimal>,
+        rebates: Decimal,
+    },
+    /// Invested amount (open positions value).
+    #[allow(dead_code)]
+    InvestedUpdate(Decimal),
+    /// Open positions count.
+    #[allow(dead_code)]
+    OpenPosUpdate(usize),
+    /// Pause/resume display (actual pause is handled in main).
+    #[allow(dead_code)]
+    Paused(bool),
+}
+
+/// One row in the Active Rounds table.
+#[derive(Debug, Clone)]
+pub struct TuiRoundRow {
+    pub coin: Coin,
+    pub period: Period,
+    pub round_start: i64,
+    pub elapsed_pct: f64,
+    pub yes_price: Decimal,
+    pub no_price: Decimal,
+    pub strategy: String,
+    pub status: String,
+}
+
+/// One row in the Spread Capture table.
+#[derive(Debug, Clone)]
+pub struct TuiSpreadRow {
+    pub round_key: String,
+    pub pair_cost: Decimal,
+    pub imbalance_pct: f64,
+    pub est_profit: Decimal,
+}
+
+/// All dashboard state consumed by the TUI.
+#[derive(Debug, Clone, Default)]
+pub struct TuiData {
+    pub balance: Decimal,
+    pub invested: Decimal,
+    pub open_pos: usize,
+    pub pnl: Decimal,
+    pub pnl_pct: f64,
+    pub win_rate_pct: f64,
+    pub trades: u64,
+    pub rounds: u64,
+    pub uptime_secs: u64,
+    pub avg_pair_cost: Option<Decimal>,
+    pub rebates: Decimal,
+    pub active_rounds: Vec<TuiRoundRow>,
+    pub spread_captures: Vec<TuiSpreadRow>,
+    pub pnl_history: Vec<f64>,
+    pub trade_log: Vec<String>,
+    pub paused: bool,
 }

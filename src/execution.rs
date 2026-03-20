@@ -13,7 +13,7 @@ use polymarket_client_sdk::clob::types::{OrderType, Side, SignatureType};
 use polymarket_client_sdk::clob::{Client, Config};
 use polymarket_client_sdk::types::{Address, U256};
 use polymarket_client_sdk::POLYGON;
-use polymarket_client_sdk::{auth::LocalSigner, auth::Signer};
+use polymarket_client_sdk::auth::LocalSigner;
 use rust_decimal::Decimal;
 use std::str::FromStr as _;
 use std::sync::Arc;
@@ -32,9 +32,12 @@ type ConcreteSigner = LocalSigner<ecdsa::SigningKey<k256::Secp256k1>>;
 pub struct ExecutionEngine {
     client: Arc<Mutex<AuthenticatedClient>>,
     signer: Arc<ConcreteSigner>,
+    #[allow(dead_code)]
     private_key: String, // Store private key to create alloy signer for on-chain transactions
     signature_type: u8,
+    #[allow(dead_code)]
     fee_rates: Arc<DashMap<String, FeeRate>>,
+    #[allow(dead_code)]
     http_client: reqwest::Client,
 }
 
@@ -77,6 +80,7 @@ impl ExecutionEngine {
     }
 
     /// Query fee rate for token (used for logging/cache). SDK fetches it automatically in order build.
+    #[allow(dead_code)]
     pub async fn get_fee_rate(&self, token_id: &str) -> Result<u64> {
         if let Some(fee_rate) = self.fee_rates.get(token_id) {
             if !fee_rate.is_stale(60) {
@@ -132,7 +136,7 @@ impl ExecutionEngine {
         let size_sdk = polymarket_client_sdk::types::Decimal::from_str_exact(size.to_string().as_str())
             .context("Invalid size")?;
 
-        let mut client = self.client.lock().await;
+        let client = self.client.lock().await;
 
         let order = client
             .limit_order()
@@ -194,6 +198,7 @@ impl ExecutionEngine {
     /// Note: For Gnosis Safe proxy wallets (SIGNATURE_TYPE=2), redemption calls
     /// may need to go through the Safe's execTransaction. This implementation
     /// currently supports direct EOA redemption (SIGNATURE_TYPE=0) only.
+    #[allow(dead_code)]
     pub fn get_provider_with_signer(
         &self,
         rpc_url: &str,
@@ -212,5 +217,16 @@ impl ExecutionEngine {
             .connect_http(rpc_url);
         
         Ok(provider)
+    }
+
+    /// Get the signature type (0 = EOA, 2 = Gnosis Safe).
+    pub fn signature_type(&self) -> u8 {
+        self.signature_type
+    }
+
+    /// Get the private key (for creating signers in redemption).
+    #[allow(dead_code)]
+    pub fn private_key(&self) -> &str {
+        &self.private_key
     }
 }

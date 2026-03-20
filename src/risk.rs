@@ -5,16 +5,21 @@ use rust_decimal::Decimal;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::warn;
 
 pub struct RiskManager {
+    #[allow(dead_code)]
     config: Arc<Config>,
+    #[allow(dead_code)]
     daily_start_balance: Arc<RwLock<Decimal>>,
+    #[allow(dead_code)]
     daily_pnl: Arc<RwLock<Decimal>>,
     consecutive_sniper_losses: Arc<RwLock<u32>>,
     sniper_paused_until: Arc<RwLock<Option<DateTime<Utc>>>>,
     volatility_paused_until: Arc<RwLock<Option<DateTime<Utc>>>>,
+    #[allow(dead_code)]
     active_rounds: Arc<RwLock<usize>>,
+    #[allow(dead_code)]
     recent_spot_changes: Arc<RwLock<VecDeque<(Decimal, DateTime<Utc>)>>>,
 }
 
@@ -32,16 +37,19 @@ impl RiskManager {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn can_open_new_round(&self) -> bool {
         let active = *self.active_rounds.read().await;
         active < self.config.max_concurrent_rounds
     }
 
+    #[allow(dead_code)]
     pub async fn increment_active_rounds(&self) {
         let mut active = self.active_rounds.write().await;
         *active += 1;
     }
 
+    #[allow(dead_code)]
     pub async fn decrement_active_rounds(&self) {
         let mut active = self.active_rounds.write().await;
         if *active > 0 {
@@ -49,6 +57,7 @@ impl RiskManager {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn check_daily_loss_limit(&self, current_balance: Decimal) -> Result<bool> {
         let start = *self.daily_start_balance.read().await;
         let pnl = current_balance - start;
@@ -70,6 +79,7 @@ impl RiskManager {
         Ok(true)
     }
 
+    #[allow(dead_code)]
     pub async fn record_sniper_loss(&self) {
         let mut losses = self.consecutive_sniper_losses.write().await;
         *losses += 1;
@@ -86,6 +96,7 @@ impl RiskManager {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn record_sniper_win(&self) {
         let mut losses = self.consecutive_sniper_losses.write().await;
         *losses = 0;
@@ -105,6 +116,7 @@ impl RiskManager {
         false
     }
 
+    #[allow(dead_code)]
     pub async fn check_round_exposure(&self, round_exposure: Decimal, total_balance: Decimal) -> bool {
         if total_balance <= Decimal::ZERO {
             return false;
@@ -113,6 +125,7 @@ impl RiskManager {
         exposure_pct <= self.config.max_round_exposure_pct
     }
 
+    #[allow(dead_code)]
     pub async fn record_spot_change(&self, price_change_pct: Decimal) {
         let mut changes = self.recent_spot_changes.write().await;
         changes.push_back((price_change_pct, Utc::now()));
@@ -124,6 +137,7 @@ impl RiskManager {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn check_volatility_pause(&self) -> bool {
         let paused_until = self.volatility_paused_until.read().await;
         if let Some(until) = *paused_until {
@@ -163,6 +177,7 @@ impl RiskManager {
         false
     }
 
+    #[allow(dead_code)]
     pub async fn update_daily_pnl(&self, current_balance: Decimal) {
         let start = *self.daily_start_balance.read().await;
         let pnl = current_balance - start;

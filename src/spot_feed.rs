@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::collections::VecDeque;
 use tokio::sync::watch;
 use tokio::time::{sleep, Duration};
@@ -164,6 +164,7 @@ impl SpotFeed {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn set_opening_price(&mut self, price: Decimal, round_start: i64) -> Result<()> {
         let mut state = self.sender.borrow().clone();
         state.opening_price = Some(price);
@@ -173,6 +174,7 @@ impl SpotFeed {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn get_recent_prices(
         &self,
         recent_prices: &VecDeque<(Decimal, DateTime<Utc>)>,

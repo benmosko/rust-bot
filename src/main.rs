@@ -10,34 +10,53 @@ mod risk;
 mod sniper;
 mod spread_capture;
 mod spot_feed;
+mod tui;
 mod types;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
 use config::Config;
 use dashmap::DashMap;
-use polymarket_client_sdk::types::Address;
 use std::collections::HashMap;
 use std::str::FromStr as _;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
-use types::{BotState, Coin, Period, Round};
+use tracing::{debug, error, info, warn};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use types::{BotState, Coin, Period, Round, TuiEvent};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
     // Load config
     let config = Arc::new(Config::from_env().context("Failed to load config")?);
 
-    // Initialize logging
+    // TUI event channel (dashboard consumes events)
+    let (tui_tx, tui_rx) = mpsc::channel(256);
+    let main_shutdown = CancellationToken::new();
+
+    // Initialize logging: file (JSON) + TUI trade log (plain)
     let file_appender = tracing_appender::rolling::daily(".", &config.log_file);
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
-    
-    tracing_subscriber::fmt()
-        .with_env_filter(&config.rust_log)
-        .with_writer(non_blocking)
-        .json()
+
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&config.rust_log));
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(tracing_subscriber::fmt::layer().with_writer(non_blocking).json())
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(tui::tui_writer_layer(tui_tx.clone()))
+                .with_ansi(false)
+                .with_target(true)
+                .with_level(true),
+        )
         .init();
 
     info!("Starting Polymarket trading bot");
@@ -63,7 +82,7 @@ async fn main() -> Result<()> {
         .transpose()?
         .unwrap_or_else(|| {
             // Fallback: derive from signer if no funder specified
-            use polymarket_client_sdk::{auth::LocalSigner, auth::Signer};
+            use polymarket_client_sdk::auth::LocalSigner;
             let signer = LocalSigner::from_str(&config.private_key).unwrap();
             signer.address()
         });
@@ -78,6 +97,7 @@ async fn main() -> Result<()> {
     // Initialize risk manager (use initial balance from watch channel)
     let start_balance = *balance_receiver.borrow();
     let risk = Arc::new(risk::RiskManager::new(config.clone(), start_balance));
+    let session_start = Utc::now();
 
     // Initialize orderbook manager
     let orderbook = Arc::new(orderbook::OrderbookManager::new());
@@ -89,9 +109,48 @@ async fn main() -> Result<()> {
         funder_address,
     ));
 
-    // Main round management loop
-    let main_shutdown = CancellationToken::new();
-    
+    // Spawn TUI (when user presses q, TUI exits and we cancel main_shutdown)
+    let main_shutdown_for_tui = main_shutdown.clone();
+    tokio::spawn(async move {
+        if let Err(e) = tui::run_tui(tui_rx, main_shutdown_for_tui.clone()).await {
+            error!(error = %e, "TUI error");
+        }
+        main_shutdown_for_tui.cancel();
+    });
+
+    // Spawn balance → TUI updater (BalanceUpdate, PnlUpdate, SessionStats)
+    let balance_receiver_tui = balance_receiver.clone();
+    let tui_tx_balance = tui_tx.clone();
+    let shutdown_balance = main_shutdown.clone();
+    tokio::spawn(async move {
+        let daily_start = start_balance;
+        while !shutdown_balance.is_cancelled() {
+            let current = *balance_receiver_tui.borrow();
+            let pnl = current - daily_start;
+            let pnl_pct = if daily_start > rust_decimal::Decimal::ZERO {
+                (pnl / daily_start)
+                    .to_string()
+                    .parse::<f64>()
+                    .unwrap_or(0.0)
+                    * 100.0
+            } else {
+                0.0
+            };
+            let _ = tui_tx_balance.try_send(TuiEvent::BalanceUpdate(current));
+            let _ = tui_tx_balance.try_send(TuiEvent::PnlUpdate(pnl));
+            let _ = tui_tx_balance.try_send(TuiEvent::SessionStats {
+                trades: 0,
+                rounds: 0,
+                win_rate_pct: 0.0,
+                pnl_pct,
+                uptime_secs: (Utc::now() - session_start).num_seconds().max(0) as u64,
+                avg_pair_cost: None,
+                rebates: rust_decimal::Decimal::ZERO,
+            });
+            sleep(Duration::from_secs(5)).await;
+        }
+    });
+
     // Spawn spot feeds for each coin
     let mut spot_feeds = HashMap::new();
     let main_shutdown_clone = main_shutdown.clone();
@@ -168,10 +227,12 @@ async fn main() -> Result<()> {
     });
 
     // Main round management loop
-    let mut active_rounds: DashMap<(Coin, Period, i64), Round> = DashMap::new();
+    let active_rounds: DashMap<(Coin, Period, i64), Round> = DashMap::new();
     let mut round_tasks: HashMap<(Coin, Period, i64), Vec<tokio::task::JoinHandle<()>>> =
         HashMap::new();
     let main_shutdown_for_signal = main_shutdown.clone();
+    let orderbook_for_tui = orderbook.clone();
+    let tui_tx_rounds = tui_tx.clone();
 
     // Setup graceful shutdown
     tokio::spawn(async move {
@@ -208,6 +269,7 @@ async fn main() -> Result<()> {
         }
 
         let now = Utc::now().timestamp();
+        debug!(timestamp = now, "Main loop tick");
 
         // Discover and manage rounds
         for coin in &config.coins {
@@ -218,116 +280,144 @@ async fn main() -> Result<()> {
                 let elapsed_pct = (now - round_start) as f64 / period_secs as f64;
 
                 let round_key = (*coin, *period, round_start);
+                let slug = market_discovery::generate_slug(*coin, *period, round_start);
+
+                debug!(
+                    coin = ?coin,
+                    period = ?period,
+                    round_start = round_start,
+                    slug = %slug,
+                    "Checking market"
+                );
 
                 // Check if we need to fetch this round
                 if !active_rounds.contains_key(&round_key) {
-                    if let Ok(market) = market_discovery::fetch_market(*coin, *period, round_start).await {
-                        let round = Round {
-                            market: market.clone(),
-                            opening_price: None,
-                            up_fee_rate_bps: None,
-                            down_fee_rate_bps: None,
-                        };
+                    match market_discovery::fetch_market(*coin, *period, round_start).await {
+                        Ok(market) => {
+                            info!(
+                                coin = ?coin,
+                                period = ?period,
+                                round_start = round_start,
+                                slug = %slug,
+                                "Market discovery succeeded"
+                            );
+                            let round = Round {
+                                market: market.clone(),
+                                opening_price: None,
+                                up_fee_rate_bps: None,
+                                down_fee_rate_bps: None,
+                            };
 
-                        active_rounds.insert(round_key, round.clone());
+                            active_rounds.insert(round_key, round.clone());
 
-                        // Subscribe to orderbooks
-                        orderbook.subscribe(market.up_token_id.clone())?;
-                        orderbook.subscribe(market.down_token_id.clone())?;
+                            // Subscribe to orderbooks
+                            orderbook.subscribe(market.up_token_id.clone())?;
+                            orderbook.subscribe(market.down_token_id.clone())?;
 
-                        // Get opening price from spot feed (use current price as proxy if not set)
-                        let spot_receiver_opt = spot_feeds.get(coin).cloned();
-                        if let Some(spot_receiver) = spot_receiver_opt {
-                            let spot_state = spot_receiver.borrow().clone();
-                            let opening_price = spot_state.opening_price.unwrap_or(spot_state.price);
+                            // Get opening price from spot feed (use current price as proxy if not set)
+                            let spot_receiver_opt = spot_feeds.get(coin).cloned();
+                            if let Some(spot_receiver) = spot_receiver_opt {
+                                let spot_state = spot_receiver.borrow().clone();
+                                let opening_price = spot_state.opening_price.unwrap_or(spot_state.price);
 
-                            // Spawn spread capture (gabagool)
-                            let sc_config = config.clone();
-                            let sc_execution = execution.clone();
-                            let sc_orderbook = orderbook.clone();
-                            let sc_market = market.clone();
-                            let sc_shutdown = main_shutdown.clone();
-                            let sc_handle = tokio::spawn(async move {
-                                let mut sc = spread_capture::SpreadCapture::new(
-                                    sc_market,
-                                    sc_config,
-                                    sc_execution,
-                                    sc_orderbook,
+                                // Spawn spread capture (gabagool)
+                                let sc_config = config.clone();
+                                let sc_execution = execution.clone();
+                                let sc_orderbook = orderbook.clone();
+                                let sc_market = market.clone();
+                                let sc_shutdown = main_shutdown.clone();
+                                let sc_handle = tokio::spawn(async move {
+                                    let mut sc = spread_capture::SpreadCapture::new(
+                                        sc_market,
+                                        sc_config,
+                                        sc_execution,
+                                        sc_orderbook,
+                                    );
+                                    if let Err(e) = sc.run(sc_shutdown).await {
+                                        error!(error = %e, "Spread capture error");
+                                    }
+                                });
+
+                                // Spawn momentum
+                                let mom_config = config.clone();
+                                let mom_execution = execution.clone();
+                                let mom_orderbook = orderbook.clone();
+                                let mom_spot = spot_receiver.clone();
+                                let mom_market = market.clone();
+                                let mom_risk = risk.clone();
+                                let mom_shutdown = main_shutdown.clone();
+                                let mom_handle = tokio::spawn(async move {
+                                    let mut mom = momentum::Momentum::new(
+                                        mom_market,
+                                        mom_config,
+                                        mom_execution,
+                                        mom_orderbook,
+                                        mom_spot,
+                                        mom_risk,
+                                        opening_price,
+                                    );
+                                    if let Err(e) = mom.run(mom_shutdown).await {
+                                        error!(error = %e, "Momentum error");
+                                    }
+                                });
+
+                                // Spawn market maker
+                                let mm_config = config.clone();
+                                let mm_execution = execution.clone();
+                                let mm_orderbook = orderbook.clone();
+                                let mm_spot = spot_receiver.clone();
+                                let mm_market = market.clone();
+                                let mm_shutdown = main_shutdown.clone();
+                                let mm_handle = tokio::spawn(async move {
+                                    let mut mm = market_maker::MarketMaker::new(
+                                        mm_market,
+                                        mm_config,
+                                        mm_execution,
+                                        mm_orderbook,
+                                        mm_spot,
+                                    );
+                                    if let Err(e) = mm.run(mm_shutdown).await {
+                                        error!(error = %e, "Market maker error");
+                                    }
+                                });
+
+                                // Spawn sniper (late entry)
+                                let sniper_config = config.clone();
+                                let sniper_execution = execution.clone();
+                                let sniper_orderbook = orderbook.clone();
+                                let sniper_spot = spot_receiver.clone();
+                                let sniper_market = market.clone();
+                                let sniper_risk = risk.clone();
+                                let sniper_shutdown = main_shutdown.clone();
+                                let sniper_handle = tokio::spawn(async move {
+                                    let mut sniper = sniper::Sniper::new(
+                                        sniper_market,
+                                        sniper_config,
+                                        sniper_execution,
+                                        sniper_orderbook,
+                                        sniper_spot,
+                                        sniper_risk,
+                                        opening_price,
+                                    );
+                                    if let Err(e) = sniper.run(sniper_shutdown).await {
+                                        error!(error = %e, "Sniper error");
+                                    }
+                                });
+
+                                round_tasks.insert(
+                                    round_key,
+                                    vec![sc_handle, mom_handle, mm_handle, sniper_handle],
                                 );
-                                if let Err(e) = sc.run(sc_shutdown).await {
-                                    error!(error = %e, "Spread capture error");
-                                }
-                            });
-
-                            // Spawn momentum
-                            let mom_config = config.clone();
-                            let mom_execution = execution.clone();
-                            let mom_orderbook = orderbook.clone();
-                            let mom_spot = spot_receiver.clone();
-                            let mom_market = market.clone();
-                            let mom_risk = risk.clone();
-                            let mom_shutdown = main_shutdown.clone();
-                            let mom_handle = tokio::spawn(async move {
-                                let mut mom = momentum::Momentum::new(
-                                    mom_market,
-                                    mom_config,
-                                    mom_execution,
-                                    mom_orderbook,
-                                    mom_spot,
-                                    mom_risk,
-                                    opening_price,
-                                );
-                                if let Err(e) = mom.run(mom_shutdown).await {
-                                    error!(error = %e, "Momentum error");
-                                }
-                            });
-
-                            // Spawn market maker
-                            let mm_config = config.clone();
-                            let mm_execution = execution.clone();
-                            let mm_orderbook = orderbook.clone();
-                            let mm_spot = spot_receiver.clone();
-                            let mm_market = market.clone();
-                            let mm_shutdown = main_shutdown.clone();
-                            let mm_handle = tokio::spawn(async move {
-                                let mut mm = market_maker::MarketMaker::new(
-                                    mm_market,
-                                    mm_config,
-                                    mm_execution,
-                                    mm_orderbook,
-                                    mm_spot,
-                                );
-                                if let Err(e) = mm.run(mm_shutdown).await {
-                                    error!(error = %e, "Market maker error");
-                                }
-                            });
-
-                            // Spawn sniper (late entry)
-                            let sniper_config = config.clone();
-                            let sniper_execution = execution.clone();
-                            let sniper_orderbook = orderbook.clone();
-                            let sniper_spot = spot_receiver.clone();
-                            let sniper_market = market.clone();
-                            let sniper_risk = risk.clone();
-                            let sniper_shutdown = main_shutdown.clone();
-                            let sniper_handle = tokio::spawn(async move {
-                                let mut sniper = sniper::Sniper::new(
-                                    sniper_market,
-                                    sniper_config,
-                                    sniper_execution,
-                                    sniper_orderbook,
-                                    sniper_spot,
-                                    sniper_risk,
-                                    opening_price,
-                                );
-                                if let Err(e) = sniper.run(sniper_shutdown).await {
-                                    error!(error = %e, "Sniper error");
-                                }
-                            });
-
-                            round_tasks.insert(
-                                round_key,
-                                vec![sc_handle, mom_handle, mm_handle, sniper_handle],
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                coin = ?coin,
+                                period = ?period,
+                                round_start = round_start,
+                                slug = %slug,
+                                error = %e,
+                                "Market discovery failed"
                             );
                         }
                     }
@@ -337,17 +427,42 @@ async fn main() -> Result<()> {
                 if round_end - now < 30 {
                     let next_round_start = round_start + period_secs;
                     let next_key = (*coin, *period, next_round_start);
+                    let next_slug = market_discovery::generate_slug(*coin, *period, next_round_start);
                     if !active_rounds.contains_key(&next_key) {
-                        if let Ok(next_market) =
-                            market_discovery::fetch_market(*coin, *period, next_round_start).await
-                        {
-                            let next_round = Round {
-                                market: next_market,
-                                opening_price: None,
-                                up_fee_rate_bps: None,
-                                down_fee_rate_bps: None,
-                            };
-                            active_rounds.insert(next_key, next_round);
+                        debug!(
+                            coin = ?coin,
+                            period = ?period,
+                            next_round_start = next_round_start,
+                            slug = %next_slug,
+                            "Pre-fetching next round"
+                        );
+                        match market_discovery::fetch_market(*coin, *period, next_round_start).await {
+                            Ok(next_market) => {
+                                debug!(
+                                    coin = ?coin,
+                                    period = ?period,
+                                    next_round_start = next_round_start,
+                                    slug = %next_slug,
+                                    "Next round pre-fetch succeeded"
+                                );
+                                let next_round = Round {
+                                    market: next_market,
+                                    opening_price: None,
+                                    up_fee_rate_bps: None,
+                                    down_fee_rate_bps: None,
+                                };
+                                active_rounds.insert(next_key, next_round);
+                            }
+                            Err(e) => {
+                                warn!(
+                                    coin = ?coin,
+                                    period = ?period,
+                                    next_round_start = next_round_start,
+                                    slug = %next_slug,
+                                    error = %e,
+                                    "Next round pre-fetch failed"
+                                );
+                            }
                         }
                     }
                 }
@@ -360,6 +475,28 @@ async fn main() -> Result<()> {
                             handle.abort();
                         }
                     }
+                }
+
+                // Send round update to TUI (prices from orderbook)
+                if let Some(round) = active_rounds.get(&round_key) {
+                    let yes_price = orderbook_for_tui
+                        .get_orderbook(&round.market.up_token_id)
+                        .and_then(|ob| ob.best_bid())
+                        .unwrap_or(rust_decimal::Decimal::ZERO);
+                    let no_price = orderbook_for_tui
+                        .get_orderbook(&round.market.down_token_id)
+                        .and_then(|ob| ob.best_bid())
+                        .unwrap_or(rust_decimal::Decimal::ZERO);
+                    let _ = tui_tx_rounds.try_send(TuiEvent::RoundUpdate {
+                        coin: *coin,
+                        period: *period,
+                        round_start,
+                        elapsed_pct,
+                        yes_price,
+                        no_price,
+                        strategy: "—".to_string(),
+                        status: if now >= round_end { "Ended".to_string() } else { "Active".to_string() },
+                    });
                 }
             }
         }

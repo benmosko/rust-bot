@@ -25,6 +25,7 @@ pub struct Config {
     // Market Making
     pub mm_half_spread: Decimal,
     pub mm_volatility_spread: Decimal,
+    #[allow(dead_code)]
     pub mm_max_inventory_per_side: Decimal,
     pub mm_inventory_imbalance_limit: Decimal,
     pub mm_stop_before_end_secs: u64,
@@ -33,17 +34,27 @@ pub struct Config {
     pub snipe_min_bid: Decimal,
     pub snipe_max_spread: Decimal,
     pub snipe_min_elapsed_pct: f64,
+    #[allow(dead_code)]
     pub snipe_position_size_pct: Decimal,
+    #[allow(dead_code)]
     pub snipe_max_replacements: u32,
+    #[allow(dead_code)]
     pub snipe_no_crossover_secs: u64,
 
     // Risk
+    #[allow(dead_code)]
     pub max_concurrent_rounds: usize,
+    #[allow(dead_code)]
     pub daily_loss_limit_pct: Decimal,
+    #[allow(dead_code)]
     pub circuit_breaker_consecutive_losses: u32,
+    #[allow(dead_code)]
     pub circuit_breaker_pause_secs: u64,
+    #[allow(dead_code)]
     pub max_round_exposure_pct: Decimal,
+    #[allow(dead_code)]
     pub volatility_pause_threshold_pct: Decimal,
+    #[allow(dead_code)]
     pub volatility_pause_secs: u64,
 
     // Markets

@@ -1,10 +1,8 @@
 use crate::config::Config;
 use crate::execution::ExecutionEngine;
 use crate::orderbook::OrderbookManager;
-use crate::risk::RiskManager;
-use crate::spot_feed::SpotFeed;
 use crate::types::{InventoryState, Market, OrderState};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::Utc;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -49,7 +47,7 @@ impl MarketMaker {
 
     pub async fn run(
         &mut self,
-        mut shutdown: tokio_util::sync::CancellationToken,
+        shutdown: tokio_util::sync::CancellationToken,
     ) -> Result<()> {
         info!(
             market = %self.market.slug,

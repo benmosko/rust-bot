@@ -5,12 +5,11 @@ use crate::config::Config;
 use crate::execution::ExecutionEngine;
 use crate::orderbook::OrderbookManager;
 use crate::types::{Market, PairCost};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::Utc;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::sync::Arc;
-use tokio::sync::watch;
 use tokio::time::{sleep, Duration};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -113,7 +112,7 @@ impl SpreadCapture {
                 }
             };
 
-            let pair = self.current_pair_cost();
+            let _pair = self.current_pair_cost();
             let imbalance = self.imbalance_pct();
 
             // Only buy YES if: YES price dipped, adding YES keeps pair cost < max, and we're not over-weighted YES.

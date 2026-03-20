@@ -2,7 +2,6 @@ use crate::config::Config;
 use crate::execution::ExecutionEngine;
 use crate::orderbook::OrderbookManager;
 use crate::risk::RiskManager;
-use crate::spot_feed::SpotFeed;
 use crate::types::{Market, SpotState};
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -21,6 +20,7 @@ pub struct Sniper {
     spot_receiver: watch::Receiver<SpotState>,
     risk: Arc<RiskManager>,
     opening_price: Decimal,
+    #[allow(dead_code)]
     recent_spot_prices: Vec<Decimal>,
 }
 
@@ -48,7 +48,7 @@ impl Sniper {
 
     pub async fn run(
         &mut self,
-        mut shutdown: tokio_util::sync::CancellationToken,
+        shutdown: tokio_util::sync::CancellationToken,
     ) -> Result<()> {
         info!(
             market = %self.market.slug,

@@ -4,7 +4,6 @@ use anyhow::{Context, Result};
 use alloy::providers::ProviderBuilder;
 use polymarket_client_sdk::types::Address;
 use rust_decimal::Decimal;
-use rust_decimal::prelude::ToPrimitive;
 use rust_decimal_macros::dec;
 use std::str::FromStr as _;
 use std::sync::Arc;
@@ -47,6 +46,7 @@ impl BalanceManager {
     }
 
     /// Get current balance (from watch channel).
+    #[allow(dead_code)]
     pub async fn get_balance(&self) -> Decimal {
         *self.balance_receiver.borrow()
     }
@@ -109,6 +109,7 @@ impl BalanceManager {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn log_pnl(&self, daily_start_balance: Decimal) {
         let current = self.get_balance().await;
         let pnl = current - daily_start_balance;
