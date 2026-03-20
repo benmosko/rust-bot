@@ -86,6 +86,10 @@ pub struct Market {
     pub neg_risk: bool,
     pub taker_base_fee: Decimal,
     pub maker_base_fee: Decimal,
+    pub up_best_bid: Option<Decimal>,
+    pub up_best_ask: Option<Decimal>,
+    pub down_best_bid: Option<Decimal>,
+    pub down_best_ask: Option<Decimal>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -385,4 +389,9 @@ pub struct TuiData {
     pub pnl_history: Vec<f64>,
     pub trade_log: Vec<String>,
     pub paused: bool,
+}
+
+/// Helper function to generate strategy status key
+pub fn strategy_status_key(coin: Coin, period: Period, round_start: i64, strategy_name: &str) -> String {
+    format!("{}_{}_{}_{}", coin.as_str(), period.as_minutes(), round_start, strategy_name)
 }

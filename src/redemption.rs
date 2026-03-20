@@ -17,6 +17,7 @@ use rust_decimal::prelude::ToPrimitive;
 use rust_decimal_macros::dec;
 use std::str::FromStr as _;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::time::{sleep, Duration};
 use tracing::info;
 
@@ -95,10 +96,11 @@ pub struct RedemptionManager {
     funder_address: Address,
     #[allow(dead_code)]
     signature_type: u8,
+    dry_run: Arc<AtomicBool>,
 }
 
 impl RedemptionManager {
-    pub fn new(execution: Arc<ExecutionEngine>, rpc_url: String, funder_address: Address) -> Self {
+    pub fn new(execution: Arc<ExecutionEngine>, rpc_url: String, funder_address: Address, dry_run: Arc<AtomicBool>) -> Self {
         // Get signature_type from execution engine
         let signature_type = execution.signature_type();
         Self {
@@ -106,6 +108,7 @@ impl RedemptionManager {
             rpc_url,
             funder_address,
             signature_type,
+            dry_run,
         }
     }
 
@@ -335,6 +338,10 @@ impl RedemptionManager {
     }
 
     /// Redeem winning positions.
+    /// 
+    /// TODO: When selling or redeeming positions, query actual token balance first.
+    /// Don't assume you hold exactly size_matched shares, because fees reduce the actual tokens received.
+    /// Query the on-chain ERC1155 balance for each token_id before calling redeemPositions/mergePositions.
     #[allow(dead_code)]
     pub async fn redeem_positions(
         &self,
@@ -342,6 +349,15 @@ impl RedemptionManager {
         token_ids: Vec<String>,
         amounts: Vec<Decimal>,
     ) -> Result<()> {
+        if self.dry_run.load(Ordering::Relaxed) {
+            info!(
+                market = %market.slug,
+                token_count = token_ids.len(),
+                "DRY RUN: would redeem positions"
+            );
+            return Ok(());
+        }
+
         if !self.is_market_resolved(&market.slug).await? {
             return Ok(());
         }
@@ -449,6 +465,9 @@ impl RedemptionManager {
     }
 
     /// Merge YES+NO positions (1 YES + 1 NO = 1 USDC).
+    /// 
+    /// TODO: Query actual token balances before merging. Fees reduce the actual tokens received,
+    /// so don't assume you hold exactly yes_shares/no_shares. Query on-chain ERC1155 balances.
     #[allow(dead_code)]
     pub async fn merge_positions(
         &self,
@@ -456,6 +475,16 @@ impl RedemptionManager {
         yes_shares: Decimal,
         no_shares: Decimal,
     ) -> Result<()> {
+        if self.dry_run.load(Ordering::Relaxed) {
+            info!(
+                market = %market.slug,
+                yes_shares = %yes_shares,
+                no_shares = %no_shares,
+                "DRY RUN: would merge positions"
+            );
+            return Ok(());
+        }
+
         if yes_shares <= Decimal::ZERO || no_shares <= Decimal::ZERO {
             return Ok(());
         }

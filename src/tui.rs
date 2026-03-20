@@ -1,7 +1,8 @@
 //! Professional trading dashboard TUI using ratatui + crossterm.
 //! Renders portfolio, session stats, active rounds, spread capture, P&L sparkline, and trade log.
 
-use crate::types::{TuiData, TuiEvent, TuiRoundRow, TuiSpreadRow};
+use crate::types::{Coin, Period, TuiData, TuiEvent, TuiRoundRow, TuiSpreadRow};
+use chrono::Local;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
@@ -13,6 +14,7 @@ use ratatui::{Frame, Terminal};
 use rust_decimal::Decimal;
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -109,16 +111,17 @@ pub enum Focus {
 pub async fn run_tui(
     mut rx: mpsc::Receiver<TuiEvent>,
     shutdown: CancellationToken,
+    dry_run: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic| {
-        let _ = execute!(std::io::stderr(), LeaveAlternateScreen);
+        let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
         let _ = disable_raw_mode();
         original_hook(panic);
     }));
 
     enable_raw_mode()?;
-    let mut stdout = io::stderr();
+    let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
 
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
@@ -138,7 +141,8 @@ pub async fn run_tui(
             apply_event(&mut data, ev);
         }
 
-        terminal.draw(|f| ui(f, &data, focus, log_scroll))?;
+        let is_dry_run = dry_run.load(Ordering::Relaxed);
+        terminal.draw(|f| ui(f, &data, focus, log_scroll, is_dry_run))?;
 
         // Poll for input with 500ms timeout
         if event::poll(Duration::from_millis(TICK_MS))? {
@@ -272,7 +276,7 @@ fn apply_event(data: &mut TuiData, ev: TuiEvent) {
     }
 }
 
-fn ui(f: &mut Frame, data: &TuiData, focus: Focus, log_scroll: usize) {
+fn ui(f: &mut Frame, data: &TuiData, focus: Focus, log_scroll: usize, is_dry_run: bool) {
     let area = f.area();
 
     let chunks = Layout::new(
@@ -280,7 +284,7 @@ fn ui(f: &mut Frame, data: &TuiData, focus: Focus, log_scroll: usize) {
         [
             Constraint::Length(3),
             Constraint::Length(5),
-            Constraint::Length(8),
+            Constraint::Min(10), // 8 data rows + 1 header row = 9 lines minimum (Min ensures it can grow)
             Constraint::Length(6),
             Constraint::Min(6),
             Constraint::Length(1),
@@ -288,8 +292,14 @@ fn ui(f: &mut Frame, data: &TuiData, focus: Focus, log_scroll: usize) {
     )
     .split(area);
 
-    // Title
-    let title = Paragraph::new(" POLYMARKET BOT ")
+    // Title with live clock
+    let current_time = Local::now().format("%H:%M:%S").to_string();
+    let title_text = if is_dry_run {
+        format!(" POLYMARKET BOT [DRY RUN]  {} ", current_time)
+    } else {
+        format!(" POLYMARKET BOT  {} ", current_time)
+    };
+    let title = Paragraph::new(title_text)
         .block(Block::default().borders(Borders::ALL).style(Style::default().fg(Color::Cyan)));
     f.render_widget(title, chunks[0]);
 
@@ -315,7 +325,7 @@ fn ui(f: &mut Frame, data: &TuiData, focus: Focus, log_scroll: usize) {
     f.render_widget(portfolio, row1[0]);
 
     let pnl_color = if data.pnl >= Decimal::ZERO { Color::Green } else { Color::Red };
-    let pnl_str = format!("{:+}", data.pnl);
+    let pnl_str = format!("${:+.2}", data.pnl);
     let pnl_pct_str = format!("{:+.1}%", data.pnl_pct);
     let uptime_str = format_uptime(data.uptime_secs);
     let avg_cost_str = data
@@ -352,34 +362,70 @@ fn ui(f: &mut Frame, data: &TuiData, focus: Focus, log_scroll: usize) {
     let session = Paragraph::new(session_text).block(session_block);
     f.render_widget(session, row1[1]);
 
-    // Row 2: Active Rounds table
+    // Row 2: Active Rounds table - always show all 8 rounds
     let header_cells = ["Market", "Elapsed", "YES", "NO", "Strategy", "Status"]
         .iter()
         .map(|h| Cell::from(*h).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
     let header = Row::new(header_cells).height(1);
 
-    let rows: Vec<Row> = data
-        .active_rounds
+    // Define all 8 market slots
+    let all_slots = vec![
+        (Coin::Btc, Period::Five),
+        (Coin::Btc, Period::Fifteen),
+        (Coin::Eth, Period::Five),
+        (Coin::Eth, Period::Fifteen),
+        (Coin::Sol, Period::Five),
+        (Coin::Sol, Period::Fifteen),
+        (Coin::Xrp, Period::Five),
+        (Coin::Xrp, Period::Fifteen),
+    ];
+
+    // Get current round_start for each slot (round down to period boundary)
+    let now = chrono::Utc::now().timestamp();
+    let rows: Vec<Row> = all_slots
         .iter()
-        .take(8)
-        .map(|r| {
-            let market = format!("{} {}m", r.coin.as_str().to_uppercase(), r.period.as_minutes());
-            let pct = (r.elapsed_pct * 10.0).round() as usize;
+        .map(|(coin, period)| {
+            let period_secs = period.as_seconds();
+            let round_start = (now / period_secs) * period_secs;
+            
+            // Find matching round in data, or use defaults
+            let round_data = data.active_rounds.iter()
+                .find(|r| r.coin == *coin && r.period == *period && r.round_start == round_start)
+                .cloned();
+            
+            let (elapsed_pct, yes_price, no_price, strategy, status) = if let Some(r) = round_data {
+                (r.elapsed_pct, r.yes_price, r.no_price, r.strategy, r.status)
+            } else {
+                // Round not discovered yet - show waiting
+                let elapsed = (now - round_start) as f64 / period_secs as f64;
+                (elapsed.max(0.0).min(1.0), rust_decimal::Decimal::ZERO, rust_decimal::Decimal::ZERO, "—".to_string(), "Waiting".to_string())
+            };
+            
+            let market = format!("{} {}m", coin.as_str().to_uppercase(), period.as_minutes());
+            let pct = (elapsed_pct * 10.0).round() as usize;
             let bar: String = (0..10).map(|i| if i < pct { '█' } else { '░' }).collect();
-            let yes_s = format!("${:.2}", r.yes_price);
-            let no_s = format!("${:.2}", r.no_price);
+            let yes_s = if yes_price.is_zero() && status == "Waiting" {
+                "$0.00".to_string()
+            } else {
+                format!("${:.2}", yes_price)
+            };
+            let no_s = if no_price.is_zero() && status == "Waiting" {
+                "$0.00".to_string()
+            } else {
+                format!("${:.2}", no_price)
+            };
             Row::new(vec![
                 Cell::from(market),
                 Cell::from(bar),
                 Cell::from(yes_s),
                 Cell::from(no_s),
-                Cell::from(r.strategy.clone()),
-                Cell::from(r.status.clone()),
+                Cell::from(strategy.clone()),
+                Cell::from(status.clone()),
             ])
         })
         .collect();
 
-    let table = Table::new(rows, [Constraint::Length(10), Constraint::Length(12), Constraint::Length(8), Constraint::Length(8), Constraint::Length(12), Constraint::Length(10)])
+    let table = Table::new(rows, [Constraint::Length(10), Constraint::Length(12), Constraint::Length(8), Constraint::Length(8), Constraint::Length(15), Constraint::Length(10)])
         .header(header)
         .block(Block::default().title(" Active Rounds ").borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
     f.render_widget(table, chunks[2]);
@@ -417,22 +463,38 @@ fn ui(f: &mut Frame, data: &TuiData, focus: Focus, log_scroll: usize) {
         .block(Block::default().title(" Spread Capture ").borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
     f.render_widget(spread_table, row3[0]);
 
-    let spark_data: Vec<u64> = if data.pnl_history.is_empty() {
-        vec![0]
+    // P&L Chart - show sparkline only if we have data
+    if data.pnl_history.is_empty() {
+        // Show empty chart area with just the block
+        let empty_block = Block::default()
+            .title(" P&L Chart ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray));
+        f.render_widget(empty_block, row3[1]);
     } else {
         let min = data.pnl_history.iter().cloned().fold(f64::INFINITY, f64::min);
         let max = data.pnl_history.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         let range = (max - min).max(1.0);
-        data.pnl_history
+        let spark_data: Vec<u64> = data.pnl_history
             .iter()
-            .map(|v| (((v - min) / range) * 8.0).round() as u64)
-            .collect()
-    };
-    let sparkline = Sparkline::default()
-        .data(spark_data.as_slice())
-        .block(Block::default().title(" P&L Chart ").borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)))
-        .style(Style::default().fg(Color::Green));
-    f.render_widget(sparkline, row3[1]);
+            .map(|v| {
+                // Normalize to 0-8 range for sparkline display
+                let normalized = if range > 0.0 {
+                    (((v - min) / range) * 8.0).round() as u64
+                } else {
+                    4 // Middle if no range
+                };
+                normalized.min(8).max(0)
+            })
+            .collect();
+        
+        let pnl_color = if data.pnl >= Decimal::ZERO { Color::Green } else { Color::Red };
+        let sparkline_widget = Sparkline::default()
+            .data(spark_data.as_slice())
+            .block(Block::default().title(" P&L Chart ").borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)))
+            .style(Style::default().fg(pnl_color));
+        f.render_widget(sparkline_widget, row3[1]);
+    }
 
     // Trade Log (chunks[4])
     let log_items: Vec<ListItem> = data

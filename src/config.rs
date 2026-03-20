@@ -68,6 +68,30 @@ pub struct Config {
     // Logging
     pub rust_log: String,
     pub log_file: String,
+
+    // Strategy Mode
+    pub strategy_mode: StrategyMode,
+
+    // Dry Run
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrategyMode {
+    SniperOnly,
+    GabagoolOnly,
+    All,
+}
+
+impl StrategyMode {
+    pub fn from_str(s: &str) -> Result<Self> {
+        match s.to_lowercase().as_str() {
+            "sniper_only" => Ok(StrategyMode::SniperOnly),
+            "gabagool_only" => Ok(StrategyMode::GabagoolOnly),
+            "all" => Ok(StrategyMode::All),
+            _ => anyhow::bail!("Invalid STRATEGY_MODE: {} (must be sniper_only, gabagool_only, or all)", s),
+        }
+    }
 }
 
 impl Config {
@@ -257,6 +281,18 @@ impl Config {
         let rust_log = env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
         let log_file = env::var("LOG_FILE").unwrap_or_else(|_| "polymarket-bot.log".to_string());
 
+        // Strategy Mode (default to sniper_only)
+        let strategy_mode_str = env::var("STRATEGY_MODE")
+            .unwrap_or_else(|_| "sniper_only".to_string());
+        let strategy_mode = StrategyMode::from_str(&strategy_mode_str)
+            .context("Invalid STRATEGY_MODE")?;
+
+        // Dry Run (default to true)
+        let dry_run = env::var("DRY_RUN")
+            .unwrap_or_else(|_| "true".to_string())
+            .parse::<bool>()
+            .unwrap_or(true);
+
         Ok(Config {
             private_key,
             signature_type,
@@ -293,6 +329,8 @@ impl Config {
             cancel_replace_hard_limit_ms,
             rust_log,
             log_file,
+            strategy_mode,
+            dry_run,
         })
     }
 }

@@ -1,9 +1,10 @@
 use crate::config::Config;
 use crate::execution::ExecutionEngine;
 use crate::orderbook::OrderbookManager;
-use crate::types::{InventoryState, Market, OrderState};
+use crate::types::{InventoryState, Market, OrderState, strategy_status_key};
 use anyhow::Result;
 use chrono::Utc;
+use dashmap::DashMap;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::sync::Arc;
@@ -20,6 +21,7 @@ pub struct MarketMaker {
     spot_receiver: watch::Receiver<crate::types::SpotState>,
     inventory: Arc<tokio::sync::RwLock<InventoryState>>,
     open_orders: Arc<tokio::sync::RwLock<Vec<OrderState>>>,
+    strategy_status: Arc<DashMap<String, String>>,
 }
 
 impl MarketMaker {
@@ -29,7 +31,10 @@ impl MarketMaker {
         execution: Arc<ExecutionEngine>,
         orderbook: Arc<OrderbookManager>,
         spot_receiver: watch::Receiver<crate::types::SpotState>,
+        strategy_status: Arc<DashMap<String, String>>,
     ) -> Self {
+        let status_key = strategy_status_key(market.coin, market.period, market.round_start, "market_maker");
+        strategy_status.insert(status_key.clone(), "Watching".to_string());
         Self {
             market: market.clone(),
             config: config.clone(),
@@ -42,6 +47,7 @@ impl MarketMaker {
                 round_start: market.round_start,
             })),
             open_orders: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            strategy_status,
         }
     }
 
@@ -55,6 +61,7 @@ impl MarketMaker {
             "Starting market maker"
         );
 
+        let status_key = strategy_status_key(self.market.coin, self.market.period, self.market.round_start, "market_maker");
         let mut last_spot_price = dec!(0);
         let mut last_cancel_replace_time = Instant::now();
         let mut volatility_pause_until: Option<Instant> = None;
@@ -76,6 +83,7 @@ impl MarketMaker {
                     time_remaining = time_remaining,
                     "Stopping market making, handing off to sniper"
                 );
+                self.strategy_status.insert(status_key.clone(), "Stopped".to_string());
                 self.cancel_all_orders().await?;
                 break;
             }
@@ -83,6 +91,7 @@ impl MarketMaker {
             // Check volatility pause
             if let Some(pause_until) = volatility_pause_until {
                 if Instant::now() < pause_until {
+                    self.strategy_status.insert(status_key.clone(), "Volatility pause".to_string());
                     sleep(Duration::from_millis(100)).await;
                     continue;
                 } else {
@@ -93,6 +102,7 @@ impl MarketMaker {
             // Get current spot price
             let spot_state = self.spot_receiver.borrow().clone();
             if spot_state.is_stale(3) {
+                self.strategy_status.insert(status_key.clone(), "Stale spot".to_string());
                 warn!(market = %self.market.slug, "Spot data is stale, skipping update");
                 sleep(Duration::from_millis(500)).await;
                 continue;
@@ -100,8 +110,16 @@ impl MarketMaker {
 
             let spot_price = spot_state.price;
 
+            // Wait for valid spot price before proceeding
+            if spot_price.is_zero() {
+                self.strategy_status.insert(status_key.clone(), "Waiting for price".to_string());
+                sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+
             // Check for volatility spike
-            if last_spot_price > dec!(0) {
+            if !last_spot_price.is_zero() {
+                // Guard against division by zero
                 let price_change_pct = (spot_price - last_spot_price).abs() / last_spot_price;
                 if price_change_pct > dec!(0.01) {
                     // 1% move in 30 seconds
@@ -129,6 +147,7 @@ impl MarketMaker {
                 .and_then(|ob| ob.midpoint());
 
             if up_midpoint.is_none() || down_midpoint.is_none() {
+                self.strategy_status.insert(status_key.clone(), "Waiting for orderbook".to_string());
                 sleep(Duration::from_millis(500)).await;
                 continue;
             }
@@ -170,6 +189,7 @@ impl MarketMaker {
 
             if should_update {
                 let cancel_replace_start = Instant::now();
+                self.strategy_status.insert(status_key.clone(), "Updating quotes".to_string());
 
                 // Cancel existing orders
                 self.cancel_all_orders().await?;
@@ -178,6 +198,7 @@ impl MarketMaker {
                 let order_size = self.calculate_order_size().await?;
 
                 if order_size >= self.market.minimum_order_size {
+                    self.strategy_status.insert(status_key.clone(), "MM: active".to_string());
                     // Place YES BUY order
                     match self
                         .execution
@@ -186,6 +207,7 @@ impl MarketMaker {
                             polymarket_client_sdk::clob::types::Side::Buy,
                             yes_buy_price,
                             order_size,
+                            self.market.minimum_tick_size,
                         )
                         .await
                     {
@@ -214,6 +236,7 @@ impl MarketMaker {
                             polymarket_client_sdk::clob::types::Side::Buy,
                             no_buy_price,
                             order_size,
+                            self.market.minimum_tick_size,
                         )
                         .await
                     {
@@ -281,7 +304,8 @@ impl MarketMaker {
 
     async fn calculate_order_size(&self) -> Result<Decimal> {
         // Use a fixed size for now, could be made configurable
-        Ok(dec!(100))
+        // Round to 2 decimal places (size always uses 2dp)
+        Ok(dec!(100).round_dp(2))
     }
 
     fn is_high_volatility(&self, _spot_state: &crate::types::SpotState) -> bool {

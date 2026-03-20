@@ -29,3 +29,7 @@ k256 = "0.13"
 alloy = { version = "1.7", features = ["provider-http", "contract", "sol-types"] }
 ratatui = "0.29"
 crossterm = "0.28"
+
+[[bin]]
+name = "test-order"
+path = "src/bin/test_order.rs"

@@ -17,10 +17,31 @@ use polymarket_client_sdk::auth::LocalSigner;
 use rust_decimal::Decimal;
 use std::str::FromStr as _;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
 use tracing::info;
 
 use crate::types::FeeRate;
+
+/// Calculate the number of decimal places from a tick_size.
+/// For example, 0.01 → 2, 0.001 → 3, 0.1 → 1
+fn decimal_places_from_tick_size(tick_size: Decimal) -> u32 {
+    tick_size.to_string().split('.').nth(1).map(|s| s.len()).unwrap_or(2) as u32
+}
+
+/// Round price to tick_size precision and size to 2 decimal places.
+/// Price: 0.01→2dp, 0.001→3dp, 0.0001→4dp (based on tick_size)
+/// Size: always 2 decimal places (e.g., 8.16 shares is valid)
+fn round_price_and_size(price: Decimal, tick_size: Decimal, size: Decimal) -> (Decimal, Decimal) {
+    // Round price to tick_size precision (0.01→2dp, 0.001→3dp, 0.0001→4dp)
+    let price_decimals = decimal_places_from_tick_size(tick_size);
+    let rounded_price = price.round_dp(price_decimals);
+    
+    // Round size to 2 decimal places (always 2dp for size)
+    let rounded_size = size.round_dp(2);
+    
+    (rounded_price, rounded_size)
+}
 
 const CLOB_API_BASE: &str = "https://clob.polymarket.com";
 
@@ -39,6 +60,7 @@ pub struct ExecutionEngine {
     fee_rates: Arc<DashMap<String, FeeRate>>,
     #[allow(dead_code)]
     http_client: reqwest::Client,
+    dry_run: Arc<AtomicBool>,
 }
 
 impl ExecutionEngine {
@@ -46,6 +68,7 @@ impl ExecutionEngine {
         private_key: &str,
         signature_type: u8,
         funder_address: Option<String>,
+        dry_run: Arc<AtomicBool>,
     ) -> Result<Self> {
         let signer = LocalSigner::from_str(private_key)
             .context("Failed to create signer from private key")?;
@@ -76,6 +99,7 @@ impl ExecutionEngine {
             signature_type,
             fee_rates: Arc::new(DashMap::new()),
             http_client: reqwest::Client::new(),
+            dry_run,
         })
     }
 
@@ -130,10 +154,28 @@ impl ExecutionEngine {
         side: Side,
         price: Decimal,
         size: Decimal,
+        tick_size: Decimal,
     ) -> Result<String> {
+        // Round price to tick_size precision and size to 2 decimal places
+        let (rounded_price, rounded_size) = round_price_and_size(price, tick_size, size);
+
+        if self.dry_run.load(Ordering::Relaxed) {
+            info!(
+                side = ?side,
+                price = %rounded_price,
+                original_price = %price,
+                size = %rounded_size,
+                original_size = %size,
+                market = %token_id,
+                "DRY RUN: would place order"
+            );
+            // Return a fake order ID
+            return Ok(format!("dry_run_order_{}", Utc::now().timestamp_millis()));
+        }
+
         let token_id_u256 = U256::from_str(token_id).context("Invalid token_id for order")?;
 
-        let size_sdk = polymarket_client_sdk::types::Decimal::from_str_exact(size.to_string().as_str())
+        let size_sdk = polymarket_client_sdk::types::Decimal::from_str_exact(rounded_size.to_string().as_str())
             .context("Invalid size")?;
 
         let client = self.client.lock().await;
@@ -142,7 +184,7 @@ impl ExecutionEngine {
             .limit_order()
             .token_id(token_id_u256)
             .size(size_sdk)
-            .price(polymarket_client_sdk::types::Decimal::from_str_exact(price.to_string().as_str()).context("Invalid price")?)
+            .price(polymarket_client_sdk::types::Decimal::from_str_exact(rounded_price.to_string().as_str()).context("Invalid price")?)
             .side(side)
             .order_type(OrderType::GTC)
             .build()
@@ -164,8 +206,10 @@ impl ExecutionEngine {
         info!(
             token_id = %token_id,
             side = ?side,
-            price = %price,
-            size = %size,
+            price = %rounded_price,
+            original_price = %price,
+            size = %rounded_size,
+            original_size = %size,
             order_id = %order_id,
             "Order placed"
         );
@@ -174,6 +218,11 @@ impl ExecutionEngine {
     }
 
     pub async fn cancel_order(&self, order_id: &str) -> Result<()> {
+        if self.dry_run.load(Ordering::Relaxed) {
+            info!(order_id = %order_id, "DRY RUN: would cancel order");
+            return Ok(());
+        }
+
         let client = self.client.lock().await;
         client
             .cancel_order(order_id)
@@ -185,6 +234,11 @@ impl ExecutionEngine {
     }
 
     pub async fn cancel_all(&self) -> Result<()> {
+        if self.dry_run.load(Ordering::Relaxed) {
+            info!("DRY RUN: would cancel all orders");
+            return Ok(());
+        }
+
         let client = self.client.lock().await;
         client.cancel_all_orders().await.context("Failed to cancel all orders")?;
 
