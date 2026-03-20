@@ -32,15 +32,26 @@ fn decimal_places_from_tick_size(tick_size: Decimal) -> u32 {
 /// Round price to tick_size precision and size to 2 decimal places.
 /// Price: 0.01→2dp, 0.001→3dp, 0.0001→4dp (based on tick_size)
 /// Size: always 2 decimal places (e.g., 8.16 shares is valid)
+/// Uses string roundtrip to remove floating point artifacts.
 fn round_price_and_size(price: Decimal, tick_size: Decimal, size: Decimal) -> (Decimal, Decimal) {
     // Round price to tick_size precision (0.01→2dp, 0.001→3dp, 0.0001→4dp)
     let price_decimals = decimal_places_from_tick_size(tick_size);
     let rounded_price = price.round_dp(price_decimals);
     
+    // Force clean decimal by round-tripping through string with fixed precision
+    let price_str = format!("{:.prec$}", rounded_price, prec = price_decimals as usize);
+    let clean_price = Decimal::from_str(&price_str)
+        .unwrap_or(rounded_price); // Fallback to rounded if parse fails
+    
     // Round size to 2 decimal places (always 2dp for size)
     let rounded_size = size.round_dp(2);
     
-    (rounded_price, rounded_size)
+    // Force clean decimal by round-tripping through string with fixed precision (2dp for size)
+    let size_str = format!("{:.2}", rounded_size);
+    let clean_size = Decimal::from_str(&size_str)
+        .unwrap_or(rounded_size); // Fallback to rounded if parse fails
+    
+    (clean_price, clean_size)
 }
 
 const CLOB_API_BASE: &str = "https://clob.polymarket.com";

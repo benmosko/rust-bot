@@ -18,6 +18,9 @@ Thumbs.db
 
 # Log files
 *.log
+*.log.*
+*_debug.txt
+bot_debug.txt
 
 # State files
 state.json

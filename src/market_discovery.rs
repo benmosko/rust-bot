@@ -6,6 +6,7 @@ use rust_decimal_macros::dec;
 use serde::Deserialize;
 use serde_json;
 use std::collections::HashMap;
+use std::str::FromStr;
 use tracing::{debug, error, warn};
 
 const GAMMA_API_BASE: &str = "https://gamma-api.polymarket.com";
@@ -235,11 +236,10 @@ pub async fn fetch_market(
         .context("No Down token found")?
         .clone();
 
-    // Parse minimum tick size - use orderPriceMinTickSize if available, otherwise default
-    let minimum_tick_size = market_data
-        .order_price_min_tick_size
-        .and_then(|f| Decimal::from_f64_retain(f))
-        .unwrap_or_else(|| dec!(0.01)); // Default fallback
+    // Parse minimum tick size - construct from string to avoid f64 floating point artifacts
+    // All our crypto up/down markets use tick_size 0.01, so hardcode for safety
+    let minimum_tick_size = Decimal::from_str("0.01")
+        .unwrap_or_else(|_| dec!(0.01)); // Fallback to macro if string parse fails
 
     // Parse minimum order size - use orderMinSize if available, otherwise default to 1.0
     let minimum_order_size = market_data

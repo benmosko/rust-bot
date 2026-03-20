@@ -8,6 +8,7 @@ use chrono::Utc;
 use dashmap::DashMap;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::watch;
@@ -143,6 +144,12 @@ impl Sniper {
                             calculated
                         }
                     };
+                    
+                    // Force clean decimal by round-tripping through string with fixed precision
+                    // This removes any floating point artifacts from tick_size subtraction
+                    let maker_price_str = format!("{:.prec$}", maker_price, prec = price_decimals as usize);
+                    let maker_price = Decimal::from_str(&maker_price_str)
+                        .unwrap_or(maker_price); // Fallback to original if parse fails
 
                     // Double-check: never place orders at $1.00
                     if maker_price >= dec!(1.0) {
@@ -184,6 +191,11 @@ impl Sniper {
 
                     // Calculate position size: entire available balance
                     let order_size = self.calculate_position_size(maker_price).await?;
+                    
+                    // Force clean decimal by round-tripping through string with fixed precision (2dp for size)
+                    let order_size_str = format!("{:.2}", order_size);
+                    let order_size = Decimal::from_str(&order_size_str)
+                        .unwrap_or(order_size); // Fallback to original if parse fails
                     
                     // Minimum order size: 5 shares (Polymarket minimum)
                     if order_size < dec!(5) {
