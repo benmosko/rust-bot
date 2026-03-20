@@ -1,0 +1,23 @@
+# Rust build artifacts
+target/
+
+# Environment files with secrets
+*.env
+!.env.example
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Log files
+*.log
+
+# State files
+state.json

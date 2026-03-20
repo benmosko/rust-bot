@@ -1,0 +1,28 @@
+[package]
+name = "polymarket-bot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+polymarket-client-sdk = { version = "0.4", features = ["clob", "ws", "data"] }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rust_decimal = "1"
+rust_decimal_macros = "1"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+anyhow = "1"
+thiserror = "2"
+dotenv = "0.15"
+futures-util = "0.3"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+url = "2"
+dashmap = "6"
+tokio-util = "0.7"
+tracing-appender = "0.2"
+ecdsa = "0.16"
+k256 = "0.13"
+alloy = { version = "1.7", features = ["provider-http", "contract", "sol-types"] }
