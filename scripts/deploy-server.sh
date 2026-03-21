@@ -33,9 +33,8 @@ if systemctl is-enabled "$SUPERVISOR_SERVICE" &>/dev/null; then
   sudo systemctl --no-pager status "$SUPERVISOR_SERVICE" || true
 else
   echo "Supervisor service not installed yet (recommended: always-on Telegram control)."
-  echo "  sudo cp scripts/polymarket-supervisor.service /etc/systemd/system/"
-  echo "  sudo sed -i \"s|/home/ubuntu|$HOME|g\" /etc/systemd/system/polymarket-supervisor.service"
-  echo "  sudo systemctl daemon-reload && sudo systemctl enable --now $SUPERVISOR_SERVICE"
+  echo "  Ensure .env has TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID, then:"
+  echo "  bash scripts/install-supervisor-service.sh"
 fi
 
 if systemctl is-enabled "$SERVICE_NAME" &>/dev/null; then
