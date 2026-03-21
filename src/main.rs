@@ -1109,7 +1109,7 @@ async fn main() -> Result<()> {
                         condition_id = %condition_id,
                         round_start = round_to_cleanup_start,
                         open_entries = open_count,
-                        "OPEN round_history entries for resolution (Chainlink → Gamma fallback)"
+                        "OPEN round_history entries for resolution (Gamma official settlement)"
                     );
                     info!(
                         condition_id = %condition_id,

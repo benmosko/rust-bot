@@ -677,42 +677,6 @@ fn finalize_open_round_resolution(
     );
 }
 
-/// After `round_end`, RTDS often has open/close before Gamma sets `closed=true`. Try this before Gamma-only polling.
-fn try_chainlink_finalize_open_round(
-    tracker: &Option<Arc<ChainlinkTracker>>,
-    coin: Coin,
-    period: Period,
-    round_start: i64,
-    round_history: &Arc<Mutex<Vec<RoundHistoryEntry>>>,
-    condition_id: &str,
-    slug: &str,
-    strategy_logger: &Option<Arc<Mutex<StrategyLogger>>>,
-    spot_feeds: &Option<Arc<HashMap<Coin, watch::Receiver<SpotState>>>>,
-    telegram: &Arc<TelegramBot>,
-) -> bool {
-    let Some(t) = tracker else {
-        return false;
-    };
-    let Some(outcome) = t.try_resolve_outcome(coin, period, round_start) else {
-        return false;
-    };
-    finalize_open_round_resolution(
-        outcome,
-        Some(t),
-        round_history,
-        coin,
-        period,
-        round_start,
-        condition_id,
-        slug,
-        strategy_logger,
-        spot_feeds,
-        telegram,
-        "chainlink",
-    );
-    true
-}
-
 /// Backoff for Gamma-only polling: aggressive right after `round_end` (official `closed` often appears
 /// within 1–3 minutes; we want to notice it as soon as Polymarket’s API reflects it).
 fn gamma_poll_interval_secs(round_start: i64, period: Period) -> u64 {
@@ -728,8 +692,9 @@ fn gamma_poll_interval_secs(round_start: i64, period: Period) -> u64 {
     }
 }
 
-/// Prefer Polymarket Gamma (official settlement) when `closed` + winner is known; else Chainlink RTDS
-/// when Gamma lags (`closed=false` or ambiguous prices); else poll Gamma.
+/// Settle OPEN round_history rows from **Gamma only** (CTF-aligned with what you can claim on Polymarket).
+/// RTDS Chainlink can disagree with redeemable outcomes — we no longer finalize P&L from Chainlink.
+/// Fast [`gamma_poll_interval_secs`] polling covers the gap when Gamma lags after `round_end`.
 pub async fn resolve_round_history_open_entries_chainlink_or_gamma(
     tracker: Option<Arc<ChainlinkTracker>>,
     client: &reqwest::Client,
@@ -788,21 +753,7 @@ pub async fn resolve_round_history_open_entries_chainlink_or_gamma(
                 );
                 return;
             }
-            // `closed` but outcomePrices still ambiguous — try Chainlink, then poll Gamma.
-            if try_chainlink_finalize_open_round(
-                &tracker,
-                coin,
-                period,
-                round_start,
-                round_history,
-                condition_id,
-                slug,
-                &strategy_logger,
-                &spot_feeds,
-                &telegram,
-            ) {
-                return;
-            }
+            // `closed` but outcomePrices still ambiguous — poll Gamma until winner is inferable.
             resolve_round_history_open_entries_gamma(
                 client,
                 round_history,
@@ -821,21 +772,7 @@ pub async fn resolve_round_history_open_entries_chainlink_or_gamma(
             return;
         }
         Ok(Some(_gamma_not_closed)) => {
-            // Gamma often lags after `round_end`; Chainlink RTDS can settle ~1m later while `closed` is still false.
-            if try_chainlink_finalize_open_round(
-                &tracker,
-                coin,
-                period,
-                round_start,
-                round_history,
-                condition_id,
-                slug,
-                &strategy_logger,
-                &spot_feeds,
-                &telegram,
-            ) {
-                return;
-            }
+            // Gamma has not finalized yet — poll until `closed` + prices (Chainlink P&L disabled; can disagree with CTF).
             resolve_round_history_open_entries_gamma(
                 client,
                 round_history,
@@ -857,40 +794,10 @@ pub async fn resolve_round_history_open_entries_chainlink_or_gamma(
             warn!(
                 error = %e,
                 slug = %slug,
-                "Gamma resolution fetch failed; will try Chainlink then poll Gamma"
+                "Gamma resolution fetch failed; polling Gamma"
             );
         }
         Ok(None) => {}
-    }
-
-    if let Some(ref t) = tracker {
-        match t.try_resolve_outcome(coin, period, round_start) {
-            Some(outcome) => {
-                finalize_open_round_resolution(
-                    outcome,
-                    Some(t),
-                    round_history,
-                    coin,
-                    period,
-                    round_start,
-                    condition_id,
-                    slug,
-                    &strategy_logger,
-                    &spot_feeds,
-                    &telegram,
-                    "chainlink",
-                );
-                return;
-            }
-            None => {
-                warn!(
-                    coin = ?coin,
-                    period = ?period,
-                    round_start,
-                    "Chainlink resolution not ready (missing open/close or feed); falling back to Gamma"
-                );
-            }
-        }
     }
 
     resolve_round_history_open_entries_gamma(

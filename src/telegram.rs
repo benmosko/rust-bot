@@ -388,7 +388,7 @@ impl TelegramBot {
         let msg = format!(
             "{prefix} | {coin_u} {period} {side}\n\
              Entry: ${entry:.4} | P&L: {pnl_sign}${pnl_abs:.2}\n\
-             Chainlink: {open:.2} → {close:.2}\n\
+             Oracle ref: {open:.2} → {close:.2}\n\
              Entered with {tr}s left",
             prefix = prefix,
             coin_u = coin_u,
