@@ -677,8 +677,44 @@ fn finalize_open_round_resolution(
     );
 }
 
-/// Prefer Polymarket Gamma (official settlement) when `closed` + winner is known; else Chainlink RTDS;
-/// else poll Gamma. Chainlink alone can disagree with redeemable outcomes at window boundaries.
+/// After `round_end`, RTDS often has open/close before Gamma sets `closed=true`. Try this before Gamma-only polling.
+fn try_chainlink_finalize_open_round(
+    tracker: &Option<Arc<ChainlinkTracker>>,
+    coin: Coin,
+    period: Period,
+    round_start: i64,
+    round_history: &Arc<Mutex<Vec<RoundHistoryEntry>>>,
+    condition_id: &str,
+    slug: &str,
+    strategy_logger: &Option<Arc<Mutex<StrategyLogger>>>,
+    spot_feeds: &Option<Arc<HashMap<Coin, watch::Receiver<SpotState>>>>,
+    telegram: &Arc<TelegramBot>,
+) -> bool {
+    let Some(t) = tracker else {
+        return false;
+    };
+    let Some(outcome) = t.try_resolve_outcome(coin, period, round_start) else {
+        return false;
+    };
+    finalize_open_round_resolution(
+        outcome,
+        Some(t),
+        round_history,
+        coin,
+        period,
+        round_start,
+        condition_id,
+        slug,
+        strategy_logger,
+        spot_feeds,
+        telegram,
+        "chainlink",
+    );
+    true
+}
+
+/// Prefer Polymarket Gamma (official settlement) when `closed` + winner is known; else Chainlink RTDS
+/// when Gamma lags (`closed=false` or ambiguous prices); else poll Gamma.
 pub async fn resolve_round_history_open_entries_chainlink_or_gamma(
     tracker: Option<Arc<ChainlinkTracker>>,
     client: &reqwest::Client,
@@ -737,7 +773,21 @@ pub async fn resolve_round_history_open_entries_chainlink_or_gamma(
                 );
                 return;
             }
-            // `closed` but outcomePrices still ambiguous — poll Gamma; do not use Chainlink.
+            // `closed` but outcomePrices still ambiguous — try Chainlink, then poll Gamma.
+            if try_chainlink_finalize_open_round(
+                &tracker,
+                coin,
+                period,
+                round_start,
+                round_history,
+                condition_id,
+                slug,
+                &strategy_logger,
+                &spot_feeds,
+                &telegram,
+            ) {
+                return;
+            }
             resolve_round_history_open_entries_gamma(
                 client,
                 round_history,
@@ -756,8 +806,21 @@ pub async fn resolve_round_history_open_entries_chainlink_or_gamma(
             return;
         }
         Ok(Some(_gamma_not_closed)) => {
-            // Polymarket has not finalized this market yet. Chainlink RTDS can disagree with
-            // the eventual CTF outcome — wait for Gamma only (no early Chainlink settlement).
+            // Gamma often lags after `round_end`; Chainlink RTDS can settle ~1m later while `closed` is still false.
+            if try_chainlink_finalize_open_round(
+                &tracker,
+                coin,
+                period,
+                round_start,
+                round_history,
+                condition_id,
+                slug,
+                &strategy_logger,
+                &spot_feeds,
+                &telegram,
+            ) {
+                return;
+            }
             resolve_round_history_open_entries_gamma(
                 client,
                 round_history,
@@ -833,7 +896,7 @@ pub async fn resolve_round_history_open_entries_chainlink_or_gamma(
 }
 
 /// Poll Gamma until the market is resolved (`closed` + `outcomePrices`), then set OPEN rows to WON/LOST.
-/// Retries every 30s; stops on `shutdown` or once all matching OPEN rows are settled.
+/// Retries every 15s; stops on `shutdown` or once all matching OPEN rows are settled.
 pub async fn resolve_round_history_open_entries_gamma(
     client: &reqwest::Client,
     round_history: &Arc<Mutex<Vec<RoundHistoryEntry>>>,
@@ -917,14 +980,14 @@ pub async fn resolve_round_history_open_entries_gamma(
                     condition_id = %condition_id,
                     slug = %slug,
                     closed = res.closed,
-                    "Gamma market not fully resolved yet; retry in 30s"
+                    "Gamma market not fully resolved yet; retry in 15s"
                 );
             }
             Ok(None) => {
                 debug!(
                     condition_id = %condition_id,
                     slug = %slug,
-                    "Gamma markets: empty response; retry in 30s"
+                    "Gamma markets: empty response; retry in 15s"
                 );
             }
             Err(e) => {
@@ -932,14 +995,14 @@ pub async fn resolve_round_history_open_entries_gamma(
                     error = %e,
                     condition_id = %condition_id,
                     slug = %slug,
-                    "Gamma resolution fetch error; retry in 30s"
+                    "Gamma resolution fetch error; retry in 15s"
                 );
             }
         }
 
         tokio::select! {
             _ = shutdown.cancelled() => return,
-            _ = sleep(Duration::from_secs(30)) => {}
+            _ = sleep(Duration::from_secs(15)) => {}
         }
     }
 }
