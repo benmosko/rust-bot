@@ -204,6 +204,66 @@ impl TelegramBot {
         });
     }
 
+    /// One-shot message after the trading bot starts: Mini App buttons when `TELEGRAM_WEBAPP_PUBLIC_URL` is set.
+    pub fn send_startup_message(&self, session_id: &str) {
+        if !self.inner.enabled {
+            return;
+        }
+        let inner = self.inner.clone();
+        let session_id = session_id.to_string();
+        tokio::spawn(async move {
+            let has_mini_app = inner.web_app_dashboard_url.is_some()
+                || inner.web_app_positions_url.is_some();
+            let mut text = format!(
+                "🟢 <b>Polymarket bot started</b>\n\
+                 Session: <code>{}</code>\n\n",
+                session_id
+            );
+            if has_mini_app {
+                text.push_str(
+                    "Use the buttons below for the <b>live dashboard</b> inside Telegram (opens a web view; it refreshes automatically).\n\n",
+                );
+            } else {
+                text.push_str(
+                    "<b>Mini App buttons</b> are off until you set <code>TELEGRAM_WEBAPP_PUBLIC_URL</code> to a public <b>HTTPS</b> URL that reaches this bot’s HTTP server (<code>TELEGRAM_WEBAPP_BIND</code>). \
+                     On a PC, use ngrok or Cloudflare Tunnel to expose the bind.\n\n",
+                );
+            }
+            text.push_str("Text commands: /help · /dashboard · /positions · /status");
+            let url = format!(
+                "https://api.telegram.org/bot{}/sendMessage",
+                inner.token
+            );
+            let reply_markup = web_app_keyboard(
+                inner.web_app_positions_url.as_deref(),
+                inner.web_app_dashboard_url.as_deref(),
+            );
+            let mut body = serde_json::json!({
+                "chat_id": inner.chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": true,
+            });
+            if let Some(m) = reply_markup {
+                body["reply_markup"] = m;
+            }
+            match inner.client.post(&url).json(&body).send().await {
+                Ok(resp) => {
+                    if !resp.status().is_success() {
+                        let status = resp.status();
+                        let err_body = resp.text().await.unwrap_or_default();
+                        warn!(
+                            status = %status,
+                            body = %err_body,
+                            "Telegram startup sendMessage failed"
+                        );
+                    }
+                }
+                Err(e) => warn!(error = %e, "Telegram startup sendMessage request error"),
+            }
+        });
+    }
+
     pub fn send_round_resolution(
         &self,
         coin: &str,
@@ -875,7 +935,7 @@ fn help_text() -> String {
      /pnl — session P&L and trade count from strategy DB\n\
      /positions — open sniper positions; Mini App buttons when TELEGRAM_WEBAPP_PUBLIC_URL is set\n\
      /stats — session outcome counts, win rate, total P&L\n\
-     /dashboard — combined balance, uptime, mode, stats, positions, momentum, last resolution\n\
+     /dashboard — text snapshot (Mini App live view: buttons on bot start when TELEGRAM_WEBAPP_PUBLIC_URL is set)\n\
      /pause — pause trading (blocks new orders; cancels open orders)\n\
      /resume — resume trading after /pause\n\
      /status — trading paused/active, dry run, strategy mode, uptime\n\

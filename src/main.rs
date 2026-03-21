@@ -516,6 +516,7 @@ async fn main() -> Result<()> {
             session_start,
         );
     }
+    telegram.send_startup_message(&session_id);
 
     loop {
         if main_shutdown.is_cancelled() {
