@@ -10,8 +10,11 @@ Production-grade automated trading bot for Polymarket binary crypto UP/DOWN pred
 
 ## Build
 
+Use the **release-fast** profile (faster compiles than default `release`; see `Cargo.toml`). Shortcut: `cargo brf` (alias in `.cargo/config.toml`).
+
 ```bash
-cargo build --release
+cargo build --profile release-fast --bin polymarket-bot
+# or: cargo brf
 ```
 
 ## Configuration
@@ -26,9 +29,9 @@ cargo build --release
 ## Run
 
 ```bash
-cargo run --release
+cargo run --profile release-fast --bin polymarket-bot
 # or
-./target/release/polymarket-bot.exe
+./target/release-fast/polymarket-bot.exe
 ```
 
 - Logs: JSON to file per `LOG_FILE` (default `polymarket-bot.log`), level from `RUST_LOG` (default `info`).

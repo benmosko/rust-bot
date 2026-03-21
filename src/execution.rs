@@ -103,6 +103,8 @@ pub struct ExecutionEngine {
     #[allow(dead_code)]
     http_client: reqwest::Client,
     dry_run: Arc<AtomicBool>,
+    /// When true, new orders are rejected (Telegram `/pause`). Cancels still run.
+    trading_paused: Arc<AtomicBool>,
 }
 
 impl ExecutionEngine {
@@ -111,6 +113,7 @@ impl ExecutionEngine {
         signature_type: u8,
         funder_address: Option<String>,
         dry_run: Arc<AtomicBool>,
+        trading_paused: Arc<AtomicBool>,
     ) -> Result<Self> {
         let signer = LocalSigner::from_str(private_key)
             .context("Failed to create signer from private key")?;
@@ -142,6 +145,7 @@ impl ExecutionEngine {
             fee_rates: Arc::new(DashMap::new()),
             http_client: reqwest::Client::new(),
             dry_run,
+            trading_paused,
         })
     }
 
@@ -203,6 +207,10 @@ impl ExecutionEngine {
         let e0 = Instant::now();
 
         let (rounded_price, rounded_size) = round_price_and_size(price, tick_size, size);
+
+        if self.trading_paused.load(Ordering::Relaxed) {
+            anyhow::bail!("Trading paused (use Telegram /resume)");
+        }
 
         if self.dry_run.load(Ordering::Relaxed) {
             let (making_amount, taking_amount) = if side == Side::Buy {

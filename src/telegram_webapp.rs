@@ -1,4 +1,4 @@
-//! HTTPS Mini App: live client-side countdown for open positions (`initData` validated server-side).
+//! HTTPS Mini App: positions countdown + live dashboard (initData validated server-side).
 
 use crate::types::{Coin, Period, RoundHistoryEntry, RoundHistoryStatus};
 use axum::extract::State;
@@ -7,32 +7,45 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Json;
 use axum::Router;
-use hmac::{Hmac, Mac};
+use dashmap::DashMap;
 use rust_decimal::prelude::ToPrimitive;
 use serde::Deserialize;
 use serde::Serialize;
-use sha2::Sha256;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio::sync::watch;
 use tower_http::cors::CorsLayer;
 use tracing::{error, info, warn};
 
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+
 type HmacSha256 = Hmac<Sha256>;
 
-const HTML: &str = include_str!("../static/telegram_positions.html");
+const HTML_POSITIONS: &str = include_str!("../static/telegram_positions.html");
+const HTML_DASHBOARD: &str = include_str!("../static/telegram_dashboard.html");
 
 /// Max age of `auth_date` in initData (replay protection).
 const MAX_AUTH_AGE_SECS: i64 = 86400;
 
 #[derive(Clone)]
-struct AppState {
+struct MiniAppState {
     bot_token: String,
     allowed_chat_id: String,
     round_history: Arc<Mutex<Vec<RoundHistoryEntry>>>,
+    trading_paused: Arc<AtomicBool>,
+    dry_run: Arc<AtomicBool>,
+    balance_rx: watch::Receiver<rust_decimal::Decimal>,
+    strategy_status: Arc<DashMap<String, String>>,
+    session_start: chrono::DateTime<chrono::Utc>,
+    #[allow(dead_code)]
+    session_start_balance: rust_decimal::Decimal,
+    strategy_mode: String,
 }
 
 #[derive(Deserialize)]
-struct PositionsBody {
+struct InitDataBody {
     init_data: String,
 }
 
@@ -51,23 +64,57 @@ struct PositionRow {
     round_end: i64,
 }
 
-/// Starts the HTTP server for the Mini App + JSON API. Requires HTTPS in front for production
-/// (Telegram Web Apps). Set `TELEGRAM_WEBAPP_PUBLIC_URL` in the bot for the Web App button.
+#[derive(Serialize)]
+struct DashboardResponse {
+    server_now: i64,
+    trading_paused: bool,
+    dry_run: bool,
+    strategy_mode: String,
+    balance_usdc: f64,
+    session_pnl: f64,
+    uptime_secs: u64,
+    positions: Vec<PositionRow>,
+    strategy_status: Vec<StatusRow>,
+}
+
+#[derive(Serialize)]
+struct StatusRow {
+    key: String,
+    value: String,
+}
+
+/// Starts the HTTP server for Mini Apps + JSON APIs. Requires HTTPS in front for production.
 pub fn spawn_http_server(
     bind: SocketAddr,
     bot_token: String,
     allowed_chat_id: String,
     round_history: Arc<Mutex<Vec<RoundHistoryEntry>>>,
+    trading_paused: Arc<AtomicBool>,
+    dry_run: Arc<AtomicBool>,
+    balance: Arc<crate::balance::BalanceManager>,
+    strategy_status: Arc<DashMap<String, String>>,
+    session_start: chrono::DateTime<chrono::Utc>,
+    session_start_balance: rust_decimal::Decimal,
+    strategy_mode: String,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let state = AppState {
+        let state = MiniAppState {
             bot_token,
             allowed_chat_id,
             round_history,
+            trading_paused,
+            dry_run,
+            balance_rx: balance.receiver(),
+            strategy_status,
+            session_start,
+            session_start_balance,
+            strategy_mode,
         };
         let app = Router::new()
-            .route("/telegram-positions", get(serve_html))
+            .route("/telegram-positions", get(serve_positions_html))
+            .route("/telegram-dashboard", get(serve_dashboard_html))
             .route("/api/telegram-positions", post(positions_handler))
+            .route("/api/telegram-dashboard", post(dashboard_handler))
             .with_state(state)
             .layer(CorsLayer::permissive());
 
@@ -78,20 +125,24 @@ pub fn spawn_http_server(
                 return;
             }
         };
-        info!(%bind, "Telegram Mini App HTTP server listening (HTTPS via reverse proxy in production)");
+        info!(%bind, "Telegram Mini App HTTP server (positions + dashboard)");
         if let Err(e) = axum::serve(listener, app.into_make_service()).await {
             error!(error = %e, "Telegram Mini App HTTP server error");
         }
     })
 }
 
-async fn serve_html() -> Html<&'static str> {
-    Html(HTML)
+async fn serve_positions_html() -> Html<&'static str> {
+    Html(HTML_POSITIONS)
+}
+
+async fn serve_dashboard_html() -> Html<&'static str> {
+    Html(HTML_DASHBOARD)
 }
 
 async fn positions_handler(
-    State(state): State<AppState>,
-    Json(body): Json<PositionsBody>,
+    State(state): State<MiniAppState>,
+    Json(body): Json<InitDataBody>,
 ) -> Response {
     match validate_and_user_id(&body.init_data, &state.bot_token) {
         Ok(user_id) => {
@@ -139,6 +190,86 @@ async fn positions_handler(
     .into_response()
 }
 
+async fn dashboard_handler(
+    State(state): State<MiniAppState>,
+    Json(body): Json<InitDataBody>,
+) -> Response {
+    match validate_and_user_id(&body.init_data, &state.bot_token) {
+        Ok(user_id) => {
+            if !chat_id_matches(&state.allowed_chat_id, user_id) {
+                return (
+                    StatusCode::FORBIDDEN,
+                    "Forbidden: chat does not match TELEGRAM_CHAT_ID",
+                )
+                    .into_response();
+            }
+        }
+        Err(e) => {
+            warn!(%e, "Dashboard initData validation failed");
+            return (StatusCode::UNAUTHORIZED, e).into_response();
+        }
+    }
+
+    let guard = match state.round_history.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "state lock poisoned").into_response();
+        }
+    };
+    let rh: Vec<RoundHistoryEntry> = guard.clone();
+    drop(guard);
+
+    let server_now = chrono::Utc::now().timestamp();
+    let balance_usdc = state
+        .balance_rx
+        .borrow()
+        .to_f64()
+        .unwrap_or(0.0);
+    let session_pnl = crate::types::RoundHistoryEntry::sum_session_pnl(&rh)
+        .to_f64()
+        .unwrap_or(0.0);
+
+    let mut positions: Vec<PositionRow> = Vec::new();
+    for e in rh.iter() {
+        if !matches!(e.status, RoundHistoryStatus::Open) {
+            continue;
+        }
+        positions.push(PositionRow {
+            coin: coin_display(e.coin),
+            period: period_display(e.period),
+            side: e.side_label.clone(),
+            entry_price: e.entry_price.to_f64().unwrap_or(0.0),
+            round_end: e.round_end,
+        });
+    }
+
+    let mut strategy_status: Vec<StatusRow> = Vec::new();
+    for r in state.strategy_status.iter() {
+        strategy_status.push(StatusRow {
+            key: r.key().clone(),
+            value: r.value().clone(),
+        });
+    }
+    strategy_status.sort_by(|a, b| a.key.cmp(&b.key));
+
+    let uptime_secs = (chrono::Utc::now() - state.session_start)
+        .num_seconds()
+        .max(0) as u64;
+
+    Json(DashboardResponse {
+        server_now,
+        trading_paused: state.trading_paused.load(Ordering::Relaxed),
+        dry_run: state.dry_run.load(Ordering::Relaxed),
+        strategy_mode: state.strategy_mode.clone(),
+        balance_usdc,
+        session_pnl,
+        uptime_secs,
+        positions,
+        strategy_status,
+    })
+    .into_response()
+}
+
 fn coin_display(c: Coin) -> String {
     c.as_str().to_uppercase()
 }
@@ -158,7 +289,6 @@ fn chat_id_matches(allowed: &str, user_id: i64) -> bool {
     false
 }
 
-/// Validates [Telegram Web App init data](https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app) and returns Telegram user id.
 fn validate_and_user_id(init_data: &str, bot_token: &str) -> Result<i64, String> {
     if init_data.is_empty() {
         return Err("empty init_data".into());

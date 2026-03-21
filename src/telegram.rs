@@ -1,6 +1,7 @@
 //! Telegram notifications and long-poll command handler (reqwest only; no teloxide).
 
 use crate::balance::fetch_usdc_balance;
+use crate::execution::ExecutionEngine;
 use crate::types::{Coin, Period, RoundHistoryEntry, RoundHistoryStatus};
 use polymarket_client_sdk::types::Address;
 use reqwest::Client;
@@ -8,6 +9,7 @@ use rust_decimal::prelude::ToPrimitive;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::time::{sleep, Duration};
 use tracing::{error, warn};
@@ -29,6 +31,8 @@ struct TelegramBotInner {
     enabled: bool,
     /// Base `TELEGRAM_WEBAPP_PUBLIC_URL` + `/telegram-positions` when Mini App is configured.
     web_app_positions_url: Option<String>,
+    /// Base + `/telegram-dashboard` for live dashboard Mini App.
+    web_app_dashboard_url: Option<String>,
 }
 
 struct TelegramReply {
@@ -53,11 +57,14 @@ impl TelegramBot {
 
         let enabled = !token.trim().is_empty() && !chat_id.trim().is_empty();
 
-        let web_app_positions_url = std::env::var("TELEGRAM_WEBAPP_PUBLIC_URL")
+        let base = std::env::var("TELEGRAM_WEBAPP_PUBLIC_URL")
             .ok()
             .map(|s| s.trim().trim_end_matches('/').to_string())
-            .filter(|s| !s.is_empty())
-            .map(|base| format!("{}/telegram-positions", base));
+            .filter(|s| !s.is_empty());
+        let web_app_positions_url = base
+            .as_ref()
+            .map(|b| format!("{}/telegram-positions", b));
+        let web_app_dashboard_url = base.map(|b| format!("{}/telegram-dashboard", b));
 
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(60))
@@ -75,6 +82,7 @@ impl TelegramBot {
                 chat_id,
                 enabled,
                 web_app_positions_url,
+                web_app_dashboard_url,
             }),
         }
     }
@@ -132,10 +140,10 @@ impl TelegramBot {
             _ => "➖ TIE",
         };
         let coin_u = coin.to_uppercase();
-        let pnl_sign = if pnl >= 0.0 { "+" } else { "" };
+        let pnl_sign = if pnl >= 0.0 { "+" } else { "-" };
         let msg = format!(
             "{prefix} | {coin_u} {period} {side}\n\
-             Entry: ${entry:.4} | P&L: {pnl_sign}${pnl_abs:.4}\n\
+             Entry: ${entry:.4} | P&L: {pnl_sign}${pnl_abs:.2}\n\
              Chainlink: {open:.2} → {close:.2}\n\
              Entered with {tr}s left",
             prefix = prefix,
@@ -158,6 +166,11 @@ impl TelegramBot {
         strategy_db_path: String,
         session_id: String,
         round_history: Arc<Mutex<Vec<RoundHistoryEntry>>>,
+        trading_paused: Arc<AtomicBool>,
+        dry_run: Arc<AtomicBool>,
+        execution: Arc<ExecutionEngine>,
+        strategy_mode_label: String,
+        session_start: chrono::DateTime<chrono::Utc>,
     ) {
         let inner = self.inner.clone();
         if !inner.enabled {
@@ -165,7 +178,6 @@ impl TelegramBot {
         }
         tokio::spawn(async move {
             let mut offset: i64 = 0;
-            // Last-seen update ids (same process redelivery / rare API quirks).
             let mut seen_update_ids: HashSet<i64> = HashSet::new();
             const SEEN_CAP: usize = 2048;
             loop {
@@ -228,6 +240,12 @@ impl TelegramBot {
                                         &session_id,
                                         &round_history,
                                         inner.web_app_positions_url.as_deref(),
+                                        inner.web_app_dashboard_url.as_deref(),
+                                        &trading_paused,
+                                        &dry_run,
+                                        &execution,
+                                        &strategy_mode_label,
+                                        session_start,
                                     )
                                     .await
                                     {
@@ -333,6 +351,12 @@ async fn handle_command(
     session_id: &str,
     round_history: &Arc<Mutex<Vec<RoundHistoryEntry>>>,
     web_app_positions_url: Option<&str>,
+    web_app_dashboard_url: Option<&str>,
+    trading_paused: &Arc<AtomicBool>,
+    dry_run: &Arc<AtomicBool>,
+    execution: &Arc<ExecutionEngine>,
+    strategy_mode_label: &str,
+    session_start: chrono::DateTime<chrono::Utc>,
 ) -> Result<TelegramReply, String> {
     let key = normalize_command(text);
     if key == "/balance" {
@@ -342,15 +366,43 @@ async fn handle_command(
         return cmd_pnl(strategy_db_path, session_id);
     }
     if key == "/positions" {
-        return cmd_positions(round_history, web_app_positions_url);
+        return cmd_positions(round_history, web_app_positions_url, web_app_dashboard_url);
     }
     if key == "/stats" {
         return cmd_stats(strategy_db_path, session_id);
     }
+    if key == "/pause" {
+        trading_paused.store(true, Ordering::Relaxed);
+        let exec = execution.clone();
+        tokio::spawn(async move {
+            if let Err(e) = exec.cancel_all().await {
+                error!(error = %e, "Telegram /pause: cancel_all failed");
+            }
+        });
+        return Ok(TelegramReply {
+            text: "⏸ Trading paused. Open orders cancelled.".to_string(),
+            reply_markup: None,
+        });
+    }
+    if key == "/resume" {
+        trading_paused.store(false, Ordering::Relaxed);
+        return Ok(TelegramReply {
+            text: "▶ Trading resumed.".to_string(),
+            reply_markup: None,
+        });
+    }
+    if key == "/status" {
+        return Ok(cmd_status(
+            trading_paused,
+            dry_run,
+            strategy_mode_label,
+            session_start,
+        ));
+    }
     if key == "/help" || key == "/start" {
         return Ok(TelegramReply {
             text: help_text(),
-            reply_markup: None,
+            reply_markup: web_app_keyboard(web_app_positions_url, web_app_dashboard_url),
         });
     }
     if key.starts_with('/') {
@@ -363,6 +415,63 @@ async fn handle_command(
         text: "Unknown command. Try /help".to_string(),
         reply_markup: None,
     })
+}
+
+fn cmd_status(
+    trading_paused: &Arc<AtomicBool>,
+    dry_run: &Arc<AtomicBool>,
+    strategy_mode_label: &str,
+    session_start: chrono::DateTime<chrono::Utc>,
+) -> TelegramReply {
+    let paused = trading_paused.load(Ordering::Relaxed);
+    let dr = dry_run.load(Ordering::Relaxed);
+    let trade_line = if paused {
+        "Trading: <b>PAUSED</b> (no new orders)"
+    } else {
+        "Trading: <b>ACTIVE</b>"
+    };
+    let dry_line = if dr {
+        "Orders: <b>DRY RUN</b> (simulated)"
+    } else {
+        "Orders: <b>LIVE</b>"
+    };
+    let uptime = (chrono::Utc::now() - session_start)
+        .num_seconds()
+        .max(0);
+    let h = uptime / 3600;
+    let m = (uptime % 3600) / 60;
+    let s = uptime % 60;
+    TelegramReply {
+        text: format!(
+            "📡 <b>Status</b>\n\
+             {trade_line}\n\
+             {dry_line}\n\
+             Strategy mode: <code>{strategy_mode_label}</code>\n\
+             Uptime: {h}h {m}m {s}s",
+        ),
+        reply_markup: None,
+    }
+}
+
+fn web_app_keyboard(
+    positions_url: Option<&str>,
+    dashboard_url: Option<&str>,
+) -> Option<serde_json::Value> {
+    let mut rows: Vec<Vec<serde_json::Value>> = Vec::new();
+    if let (Some(p), Some(d)) = (positions_url, dashboard_url) {
+        rows.push(vec![
+            serde_json::json!({"text": "⏱ Positions", "web_app": {"url": p}}),
+            serde_json::json!({"text": "📊 Live dashboard", "web_app": {"url": d}}),
+        ]);
+    } else if let Some(p) = positions_url {
+        rows.push(vec![serde_json::json!({"text": "⏱ Positions", "web_app": {"url": p}})]);
+    } else if let Some(d) = dashboard_url {
+        rows.push(vec![serde_json::json!({"text": "📊 Live dashboard", "web_app": {"url": d}})]);
+    }
+    if rows.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({"inline_keyboard": rows}))
 }
 
 async fn cmd_balance(rpc_url: &str) -> Result<TelegramReply, String> {
@@ -387,10 +496,10 @@ fn cmd_pnl(db_path: &str, session_id: &str) -> Result<TelegramReply, String> {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(|e| e.to_string())?;
-    let sign = if sum >= 0.0 { "+" } else { "" };
+    let sign = if sum >= 0.0 { "+" } else { "-" };
     Ok(TelegramReply {
         text: format!(
-            "📊 Session P&L: {sign}${amt:.4} ({n} trades)",
+            "📊 Session P&L: {sign}${amt:.2} ({n} trades)",
             sign = sign,
             amt = sum.abs(),
             n = n
@@ -402,6 +511,7 @@ fn cmd_pnl(db_path: &str, session_id: &str) -> Result<TelegramReply, String> {
 fn cmd_positions(
     round_history: &Arc<Mutex<Vec<RoundHistoryEntry>>>,
     web_app_url: Option<&str>,
+    dashboard_url: Option<&str>,
 ) -> Result<TelegramReply, String> {
     let guard = round_history.lock().map_err(|e| e.to_string())?;
     let now = chrono::Utc::now().timestamp();
@@ -426,13 +536,7 @@ fn cmd_positions(
     } else {
         lines.join("\n")
     };
-    let reply_markup = web_app_url.map(|url| {
-        serde_json::json!({
-            "inline_keyboard": [[
-                {"text": "⏱ Live countdown", "web_app": {"url": url}}
-            ]]
-        })
-    });
+    let reply_markup = web_app_keyboard(web_app_url, dashboard_url);
     Ok(TelegramReply {
         text,
         reply_markup,
@@ -471,13 +575,13 @@ fn cmd_stats(db_path: &str, session_id: &str) -> Result<TelegramReply, String> {
     } else {
         0.0
     };
-    let pnl_sign = if total_pnl >= 0.0 { "+" } else { "" };
+    let pnl_sign = if total_pnl >= 0.0 { "+" } else { "-" };
     Ok(TelegramReply {
         text: format!(
             "📈 Session Stats\n\
              WON: {won} | LOST: {lost} | HEDGED: {hedged} | TIE: {tie}\n\
              Win Rate: {wr:.1}%\n\
-             Total P&L: {pnl_sign}${tp:.4}",
+             Total P&L: {pnl_sign}${tp:.2}",
             won = won,
             lost = lost,
             hedged = hedged,
@@ -493,9 +597,12 @@ fn cmd_stats(db_path: &str, session_id: &str) -> Result<TelegramReply, String> {
 fn help_text() -> String {
     "/balance — USDC balance on the proxy wallet (on-chain)\n\
      /pnl — session P&L and trade count from strategy DB\n\
-     /positions — open sniper positions; ⏱ Live countdown opens Mini App (set TELEGRAM_WEBAPP_PUBLIC_URL + HTTP server)\n\
+     /positions — open sniper positions; Mini App buttons when TELEGRAM_WEBAPP_PUBLIC_URL is set\n\
      /stats — session outcome counts, win rate, total P&L\n\
+     /pause — pause trading (blocks new orders; cancels open orders)\n\
+     /resume — resume trading after /pause\n\
+     /status — trading paused/active, dry run, strategy mode, uptime\n\
      /help — this message\n\
-     /start — same as /help"
+     /start — same as /help (with Mini App buttons if configured)"
         .to_string()
 }

@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>Live dashboard</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --fg: #e6edf3;
+      --muted: #8b949e;
+      --accent: #58a6ff;
+      --good: #3fb950;
+      --warn: #d29922;
+      --bad: #f85149;
+      --card: #161b22;
+      --border: #30363d;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--fg);
+      min-height: 100vh;
+      padding: 12px 14px 24px;
+    }
+    h1 { font-size: 1.05rem; font-weight: 600; margin: 0 0 4px; color: var(--muted); }
+    .sub { font-size: 0.75rem; color: var(--muted); margin-bottom: 14px; }
+    .err { color: var(--bad); font-size: 0.9rem; margin-bottom: 12px; }
+    .grid {
+      display: grid;
+      gap: 10px;
+      grid-template-columns: 1fr 1fr;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 12px;
+    }
+    .card.wide { grid-column: 1 / -1; }
+    .label { font-size: 0.7rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+    .val { font-size: 1.15rem; font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 4px; }
+    .pill {
+      display: inline-block;
+      font-size: 0.75rem;
+      font-weight: 600;
+      padding: 4px 8px;
+      border-radius: 999px;
+      margin-top: 6px;
+    }
+    .pill.live { background: rgba(63, 185, 80, 0.15); color: var(--good); }
+    .pill.pause { background: rgba(210, 153, 34, 0.2); color: var(--warn); }
+    .pill.dry { background: rgba(88, 166, 255, 0.15); color: var(--accent); }
+    ul { list-style: none; padding: 0; margin: 8px 0 0; }
+    li {
+      border-bottom: 1px solid var(--border);
+      padding: 8px 0;
+      font-size: 0.88rem;
+    }
+    li:last-child { border-bottom: none; }
+    .row { display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+    .k { color: var(--muted); font-size: 0.78rem; }
+    .v { font-variant-numeric: tabular-nums; text-align: right; max-width: 65%; word-break: break-word; }
+    footer { margin-top: 14px; font-size: 0.7rem; color: var(--muted); }
+  </style>
+</head>
+<body>
+  <h1>Polymarket bot</h1>
+  <div class="sub" id="tick">Loading…</div>
+  <div class="err" id="err" style="display:none"></div>
+
+  <div class="grid" id="main" style="display:none">
+    <div class="card">
+      <div class="label">Status</div>
+      <div id="statusPills"></div>
+    </div>
+    <div class="card">
+      <div class="label">Strategy</div>
+      <div class="val" id="stratMode">—</div>
+    </div>
+    <div class="card">
+      <div class="label">USDC balance</div>
+      <div class="val" id="bal">—</div>
+    </div>
+    <div class="card">
+      <div class="label">Session P&amp;L</div>
+      <div class="val" id="pnl">—</div>
+    </div>
+    <div class="card">
+      <div class="label">Uptime</div>
+      <div class="val" id="up">—</div>
+    </div>
+    <div class="card">
+      <div class="label">Open positions</div>
+      <div class="val" id="posCount">—</div>
+    </div>
+    <div class="card wide">
+      <div class="label">Positions</div>
+      <ul id="posList"></ul>
+    </div>
+    <div class="card wide">
+      <div class="label">Strategy status</div>
+      <ul id="stList"></ul>
+    </div>
+  </div>
+
+  <footer>Refreshes every ~1.5s · server clock</footer>
+  <script>
+    const errEl = document.getElementById('err');
+    const tickEl = document.getElementById('tick');
+    const mainEl = document.getElementById('main');
+
+    function showErr(msg) {
+      errEl.style.display = 'block';
+      errEl.textContent = msg;
+    }
+
+    function fmtDur(secs) {
+      const s = Math.floor(secs % 60);
+      const m = Math.floor((secs / 60) % 60);
+      const h = Math.floor(secs / 3600);
+      if (h > 0) return h + 'h ' + m + 'm';
+      if (m > 0) return m + 'm ' + s + 's';
+      return s + 's';
+    }
+
+    async function poll() {
+      const tg = window.Telegram && window.Telegram.WebApp;
+      if (tg) { tg.ready(); tg.expand(); }
+      const initData = tg && tg.initData ? tg.initData : '';
+      if (!initData) {
+        showErr('Open this page from the Telegram Mini App (missing initData).');
+        return;
+      }
+      try {
+        const r = await fetch('/api/telegram-dashboard', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ init_data: initData })
+        });
+        if (!r.ok) {
+          const t = await r.text();
+          throw new Error(t || r.status);
+        }
+        const d = await r.json();
+        mainEl.style.display = 'grid';
+        errEl.style.display = 'none';
+
+        const now = d.server_now;
+        tickEl.textContent = 'Updated · server ' + new Date(now * 1000).toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
+
+        const pills = document.getElementById('statusPills');
+        pills.innerHTML = '';
+        if (d.trading_paused) {
+          const p = document.createElement('span');
+          p.className = 'pill pause';
+          p.textContent = 'PAUSED';
+          pills.appendChild(p);
+        } else {
+          const p = document.createElement('span');
+          p.className = 'pill live';
+          p.textContent = 'TRADING';
+          pills.appendChild(p);
+        }
+        if (d.dry_run) {
+          const p = document.createElement('span');
+          p.className = 'pill dry';
+          p.textContent = 'DRY RUN';
+          p.style.marginLeft = '6px';
+          pills.appendChild(p);
+        }
+
+        document.getElementById('stratMode').textContent = d.strategy_mode || '—';
+        document.getElementById('bal').textContent = '$' + (d.balance_usdc != null ? d.balance_usdc.toFixed(2) : '—');
+        const pnl = d.session_pnl;
+        const pnlEl = document.getElementById('pnl');
+        pnlEl.textContent = (pnl >= 0 ? '+' : '') + (pnl != null ? pnl.toFixed(2) : '—');
+        pnlEl.style.color = pnl >= 0 ? 'var(--good)' : 'var(--bad)';
+
+        document.getElementById('up').textContent = fmtDur(d.uptime_secs || 0);
+        const positions = d.positions || [];
+        document.getElementById('posCount').textContent = String(positions.length);
+
+        const posList = document.getElementById('posList');
+        posList.innerHTML = '';
+        if (positions.length === 0) {
+          const li = document.createElement('li');
+          li.className = 'muted';
+          li.textContent = 'No open positions';
+          posList.appendChild(li);
+        } else {
+          for (const p of positions) {
+            const rem = Math.max(0, p.round_end - now);
+            const li = document.createElement('li');
+            li.innerHTML = '<div class="row"><span><b>' + p.coin + '</b> ' + p.period + ' ' + p.side + '</span><span class="v">@ ' + p.entry_price.toFixed(4) + '</span></div><div style="margin-top:6px;font-size:0.85rem;color:var(--muted)">' + rem + 's to settlement</div>';
+            posList.appendChild(li);
+          }
+        }
+
+        const stList = document.getElementById('stList');
+        stList.innerHTML = '';
+        const sts = d.strategy_status || [];
+        if (sts.length === 0) {
+          const li = document.createElement('li');
+          li.textContent = '—';
+          stList.appendChild(li);
+        } else {
+          for (const s of sts) {
+            const li = document.createElement('li');
+            li.innerHTML = '<div class="row"><span class="k">' + escapeHtml(s.key) + '</span><span class="v">' + escapeHtml(s.value) + '</span></div>';
+            stList.appendChild(li);
+          }
+        }
+      } catch (e) {
+        showErr(String(e.message || e));
+      }
+    }
+
+    function escapeHtml(s) {
+      const d = document.createElement('div');
+      d.textContent = s;
+      return d.innerHTML;
+    }
+
+    poll();
+    setInterval(poll, 1500);
+  </script>
+</body>
+</html>

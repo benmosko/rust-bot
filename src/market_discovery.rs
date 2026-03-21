@@ -55,6 +55,9 @@ struct GammaMarketResponse {
     taker_base_fee: Option<u64>,
     #[serde(rename = "makerBaseFee")]
     maker_base_fee: Option<u64>,
+    /// Chainlink reference open at round start (when Gamma provides it).
+    #[serde(rename = "openingPrice")]
+    opening_price: Option<f64>,
     #[serde(flatten)]
     #[allow(dead_code)] // Intentionally unused - catches unknown fields to prevent deserialization errors
     extra: HashMap<String, serde_json::Value>,
@@ -77,9 +80,38 @@ impl Default for GammaMarketResponse {
             accepting_orders: None,
             taker_base_fee: None,
             maker_base_fee: None,
+            opening_price: None,
             extra: HashMap::new(),
         }
     }
+}
+
+fn decimal_from_gamma_json_value(v: &serde_json::Value) -> Option<Decimal> {
+    match v {
+        serde_json::Value::Number(n) => n.as_f64().and_then(Decimal::from_f64_retain),
+        serde_json::Value::String(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+/// Alternate keys sometimes present on Gamma `extra` when not deserialized into struct fields.
+fn gamma_opening_price_from_extra(extra: &HashMap<String, serde_json::Value>) -> Option<Decimal> {
+    const KEYS: &[&str] = &[
+        "openingPrice",
+        "opening_price",
+        "oraclePrice",
+        "oracle_price",
+        "priceToBeat",
+        "cryptoOpeningPrice",
+    ];
+    for k in KEYS {
+        if let Some(v) = extra.get(*k) {
+            if let Some(d) = decimal_from_gamma_json_value(v) {
+                return Some(d);
+            }
+        }
+    }
+    None
 }
 
 pub fn generate_slug(coin: Coin, period: Period, round_start: i64) -> String {
@@ -299,6 +331,11 @@ pub async fn fetch_market(
 
     let round_end = calculate_round_end(period, round_start);
 
+    let opening_price = market_data
+        .opening_price
+        .and_then(|f| Decimal::from_f64_retain(f))
+        .or_else(|| gamma_opening_price_from_extra(&market_data.extra));
+
     Ok(Market {
         condition_id: market_data.condition_id.clone(),
         slug: event.slug.clone(),
@@ -317,6 +354,7 @@ pub async fn fetch_market(
         up_best_ask,
         down_best_bid,
         down_best_ask,
+        opening_price,
     })
 }
 

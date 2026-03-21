@@ -4,6 +4,7 @@ use crate::orderbook::OrderbookManager;
 use crate::pnl::PnLManager;
 use crate::risk::RiskManager;
 use crate::rtds_chainlink::ChainlinkTracker;
+use crate::spot_feed::{spot_price_for_momentum_reversal, SharedBinanceSpotHistory};
 use crate::strategy_log::{RoundEntry, StrategyLogger};
 use crate::strategy_sizing::{self, DualLegSizing, SingleLegSizing};
 use crate::types::{
@@ -25,6 +26,13 @@ use std::time::Instant;
 use tokio::sync::{broadcast::error::RecvError, watch, mpsc};
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
+
+/// Block when Binance spot has recovered more than this fraction of its distance from round open (~10s window).
+const MOMENTUM_REVERSAL_THRESHOLD: f64 = 0.4;
+/// Tighter threshold when price is moving against the entry direction (UP vs DOWN).
+const MOMENTUM_DIRECTIONAL_THRESHOLD: f64 = 0.3;
+/// Floor for distance-from-open in `recovery_ratio` to avoid division blow-ups near zero.
+const MOMENTUM_DISTANCE_FLOOR: f64 = 0.0001;
 
 enum SniperSizingPlan {
     Single(SingleLegSizing),
@@ -78,6 +86,7 @@ pub struct Sniper {
     pending_sniper_entries: Arc<DashSet<SniperEntryKey>>,
     strategy_logger: Arc<Mutex<StrategyLogger>>,
     chainlink_tracker: Arc<ChainlinkTracker>,
+    binance_spot_history: SharedBinanceSpotHistory,
 }
 
 impl Sniper {
@@ -100,6 +109,7 @@ impl Sniper {
         pending_sniper_entries: Arc<DashSet<SniperEntryKey>>,
         strategy_logger: Arc<Mutex<StrategyLogger>>,
         chainlink_tracker: Arc<ChainlinkTracker>,
+        binance_spot_history: SharedBinanceSpotHistory,
     ) -> Self {
         let status_key = strategy_status_key(market.coin, market.period, market.round_start, "sniper");
         strategy_status.insert(status_key.clone(), "Snp: Waiting".to_string());
@@ -125,7 +135,65 @@ impl Sniper {
             pending_sniper_entries,
             strategy_logger,
             chainlink_tracker,
+            binance_spot_history,
         }
+    }
+
+    /// Last gate before placing GTC: block fast mean reversion toward round open (Binance vs `opening_price`).
+    /// Returns `true` if this leg should **not** be entered. Fails open when history is missing or ambiguous.
+    fn momentum_reversal_blocks_entry(&self, side_name: &str) -> bool {
+        let side_label = if side_name == "YES" { "UP" } else { "DOWN" };
+        let opening_price = match self.opening_price.to_f64() {
+            Some(p) if p > 0.0 => p,
+            _ => return false,
+        };
+        let current_spot = match self.spot_receiver.borrow().price.to_f64() {
+            Some(p) if p > 0.0 => p,
+            _ => return false,
+        };
+        let spot_10s_ago = match spot_price_for_momentum_reversal(
+            &self.binance_spot_history,
+            self.market.coin,
+        ) {
+            Some(p) if p > 0.0 => p,
+            _ => return false,
+        };
+
+        let current_distance = (current_spot - opening_price).abs();
+        let past_distance = (spot_10s_ago - opening_price).abs();
+        let past_denom = past_distance.max(MOMENTUM_DISTANCE_FLOOR);
+        let recovery_ratio =
+            (past_distance - current_distance.max(MOMENTUM_DISTANCE_FLOOR)) / past_denom;
+
+        let block_strong_reversal = recovery_ratio > MOMENTUM_REVERSAL_THRESHOLD;
+
+        let against_us = match side_name {
+            "YES" => current_spot < spot_10s_ago,
+            "NO" => current_spot > spot_10s_ago,
+            _ => false,
+        };
+        let block_directional =
+            against_us && recovery_ratio > MOMENTUM_DIRECTIONAL_THRESHOLD;
+
+        if block_strong_reversal || block_directional {
+            info!(
+                coin = ?self.market.coin,
+                side = %side_label,
+                opening_price = %opening_price,
+                current_spot = %current_spot,
+                spot_10s_ago = %spot_10s_ago,
+                recovery_ratio = %recovery_ratio,
+                "Momentum reversal filter: BLOCKED entry — price recovering toward open"
+            );
+            return true;
+        }
+
+        debug!(
+            coin = ?self.market.coin,
+            recovery_ratio = %recovery_ratio,
+            "Momentum filter: OK"
+        );
+        false
     }
 
     fn sniper_entry_key(&self, side_name: &str) -> SniperEntryKey {
@@ -600,6 +668,19 @@ impl Sniper {
                         ok_sizes.push(sz);
                     }
                     if ok_sizes.len() != plans.len() {
+                        self.clear_pending_keys(&reserved_keys);
+                        continue;
+                    }
+
+                    // Last gate before place: momentum reversal (Binance vs round open). Dual: abort all if any leg blocks.
+                    if plans.len() == 2 {
+                        let block_first = self.momentum_reversal_blocks_entry(&plans[0].0);
+                        let block_second = self.momentum_reversal_blocks_entry(&plans[1].0);
+                        if block_first || block_second {
+                            self.clear_pending_keys(&reserved_keys);
+                            continue;
+                        }
+                    } else if self.momentum_reversal_blocks_entry(&plans[0].0) {
                         self.clear_pending_keys(&reserved_keys);
                         continue;
                     }

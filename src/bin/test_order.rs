@@ -47,11 +47,13 @@ async fn run() -> Result<()> {
     println!("[2/6] Initializing CLOB client...");
     // Force dry_run = false for this test binary - we need to place REAL orders to test signing
     let dry_run = Arc::new(AtomicBool::new(false));
+    let trading_paused = Arc::new(AtomicBool::new(false));
     let execution = ExecutionEngine::new(
         &config.private_key,
         config.signature_type,
         config.funder_address.clone(),
         dry_run.clone(),
+        trading_paused.clone(),
     )
     .await
     .context("Failed to initialize CLOB client")?;

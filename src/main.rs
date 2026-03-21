@@ -59,6 +59,8 @@ async fn main() -> Result<()> {
 
     // Create dry_run flag as Arc<AtomicBool>
     let dry_run = Arc::new(AtomicBool::new(config.dry_run));
+    // Telegram `/pause` sets this; new orders are blocked in the execution engine.
+    let trading_paused = Arc::new(AtomicBool::new(false));
 
     // Check if we're in debug mode (RUST_LOG=debug)
     let rust_log_env = std::env::var("RUST_LOG").unwrap_or_else(|_| config.rust_log.clone());
@@ -144,7 +146,13 @@ async fn main() -> Result<()> {
 
     // Initialize execution engine
     let execution = Arc::new(
-        polymarket_bot::execution::ExecutionEngine::new(&config.private_key, config.signature_type, config.funder_address.clone(), dry_run.clone())
+        polymarket_bot::execution::ExecutionEngine::new(
+            &config.private_key,
+            config.signature_type,
+            config.funder_address.clone(),
+            dry_run.clone(),
+            trading_paused.clone(),
+        )
             .await
             .context("Failed to initialize execution engine")?,
     );
@@ -300,10 +308,12 @@ async fn main() -> Result<()> {
     }
 
     // Spawn spot feeds for each coin
+    let binance_spot_history = polymarket_bot::spot_feed::new_shared_binance_spot_history();
     let mut spot_feeds = HashMap::new();
     let main_shutdown_clone = main_shutdown.clone();
     for coin in &config.coins {
-        let mut feed = polymarket_bot::spot_feed::SpotFeed::new(*coin);
+        let mut feed =
+            polymarket_bot::spot_feed::SpotFeed::new(*coin, binance_spot_history.clone());
         let receiver = feed.receiver();
         spot_feeds.insert(*coin, receiver);
 
@@ -448,6 +458,12 @@ async fn main() -> Result<()> {
         .build()
         .context("Failed to build Gamma HTTP client")?;
 
+    let strategy_mode_str = match config.strategy_mode {
+        polymarket_bot::config::StrategyMode::SniperOnly => "sniper_only",
+        polymarket_bot::config::StrategyMode::GabagoolOnly => "gabagool_only",
+        polymarket_bot::config::StrategyMode::All => "all",
+    };
+
     let telegram = Arc::new(polymarket_bot::telegram::TelegramBot::new());
     if let Ok(bind_s) = std::env::var("TELEGRAM_WEBAPP_BIND") {
         match bind_s.parse::<std::net::SocketAddr>() {
@@ -461,6 +477,13 @@ async fn main() -> Result<()> {
                         tg_token,
                         tg_chat,
                         round_history.clone(),
+                        trading_paused.clone(),
+                        dry_run.clone(),
+                        balance.clone(),
+                        strategy_status.clone(),
+                        session_start,
+                        start_balance,
+                        strategy_mode_str.to_string(),
                     );
                 }
             }
@@ -472,6 +495,11 @@ async fn main() -> Result<()> {
         "logs/strategy.db".to_string(),
         session_id.clone(),
         round_history.clone(),
+        trading_paused.clone(),
+        dry_run.clone(),
+        execution.clone(),
+        strategy_mode_str.to_string(),
+        session_start,
     );
 
     loop {
@@ -634,7 +662,13 @@ async fn main() -> Result<()> {
                         };
 
                         active_rounds.insert(round_key, round.clone());
-                        chainlink_tracker.register_round(coin, period, round_start, market.round_end);
+                        chainlink_tracker.register_round(
+                            coin,
+                            period,
+                            round_start,
+                            market.round_end,
+                            market.opening_price,
+                        );
 
                         orderbook.initialize_orderbook(
                             market.up_token_id.clone(),
@@ -681,6 +715,7 @@ async fn main() -> Result<()> {
                                     let sniper_pending_entries = pending_sniper_entries.clone();
                                     let sniper_strategy_logger = strategy_logger.clone();
                                     let sniper_chainlink = chainlink_tracker.clone();
+                                    let sniper_binance_history = binance_spot_history.clone();
                                     let sniper_handle = tokio::spawn(async move {
                                         let mut sniper = polymarket_bot::sniper::Sniper::new(
                                             sniper_market,
@@ -701,6 +736,7 @@ async fn main() -> Result<()> {
                                             sniper_pending_entries,
                                             sniper_strategy_logger,
                                             sniper_chainlink,
+                                            sniper_binance_history,
                                         );
                                         if let Err(e) = sniper.run(sniper_shutdown).await {
                                             error!(error = %e, "Sniper error");
@@ -874,6 +910,7 @@ async fn main() -> Result<()> {
                                     let sniper_pending_entries = pending_sniper_entries.clone();
                                     let sniper_strategy_logger = strategy_logger.clone();
                                     let sniper_chainlink = chainlink_tracker.clone();
+                                    let sniper_binance_history = binance_spot_history.clone();
                                     let sniper_handle = tokio::spawn(async move {
                                         let mut sniper = polymarket_bot::sniper::Sniper::new(
                                             sniper_market,
@@ -894,6 +931,7 @@ async fn main() -> Result<()> {
                                             sniper_pending_entries,
                                             sniper_strategy_logger,
                                             sniper_chainlink,
+                                            sniper_binance_history,
                                         );
                                         if let Err(e) = sniper.run(sniper_shutdown).await {
                                             error!(error = %e, "Sniper error");

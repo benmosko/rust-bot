@@ -104,9 +104,11 @@ Rust Polymarket sniper bot with hedge. Runs on AWS EC2 24/7. Trades crypto up/do
 | `DRY_RUN` | `true` |
 
 ## Build & Run
+Always use **`release-fast`** (not plain `--release`): faster iteration builds; binary is under `target/release-fast/`. Alias: `cargo brf` → `build --profile release-fast --bin polymarket-bot` (see `.cargo/config.toml`).
+
 ```powershell
-cargo build --release --bin polymarket-bot
-$env:RUST_LOG="info"; $env:STRATEGY_MODE="sniper_only"; cargo run --release --bin polymarket-bot
+cargo build --profile release-fast --bin polymarket-bot
+$env:RUST_LOG="info"; $env:STRATEGY_MODE="sniper_only"; cargo run --profile release-fast --bin polymarket-bot
 ```
 
 ## Logs

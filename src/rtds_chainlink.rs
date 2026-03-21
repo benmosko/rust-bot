@@ -23,6 +23,17 @@ const RTDS_WS_URL: &str = "wss://ws-live-data.polymarket.com";
 /// Keep ≥ 2× longest market period (15m) so buffer fallback can still see boundary ticks.
 const PRICE_HISTORY_RETAIN_SECS: i64 = 30 * 60;
 
+/// How the round open price was chosen (affects whether late buffer ticks may refine it in [`ChainlinkTracker::on_tick`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainlinkOpenSource {
+    /// First buffered tick at/after `round_start` is within 2s of `round_start` (boundary quote).
+    Buffer,
+    /// `opening_price` from Polymarket/Gamma when the buffer tick was not a boundary quote.
+    ApiFallback,
+    /// Buffer tick used but not at the boundary (bot started late; no API open available).
+    StaleBuffer,
+}
+
 /// Outcome for a crypto UP/DOWN round from Chainlink open vs close (same rules as Polymarket).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChainlinkOutcome {
@@ -39,6 +50,8 @@ struct RoundChainlink {
     round_end: i64,
     /// First Chainlink print at/after round start while in-window (see `on_tick`).
     open: Option<Decimal>,
+    /// How `open` was chosen at registration / first tick (see [`ChainlinkOpenSource`]).
+    open_source: Option<ChainlinkOpenSource>,
     /// First print at/after `round_end` (boundary = next round open); prefer same rule as `lookup_first_ge`.
     close: Option<Decimal>,
 }
@@ -79,7 +92,7 @@ impl ChainlinkTracker {
 
     /// First chronological timestamp at/after `t`, then the **last** print at that timestamp
     /// (multiple Chainlink updates can share a second; use the latest quote at the boundary).
-    fn lookup_first_ge(&self, coin: Coin, t: i64) -> Option<Decimal> {
+    fn lookup_first_ge_with_ts(&self, coin: Coin, t: i64) -> Option<(i64, Decimal)> {
         let q = self.price_history.get(&coin)?;
         let mut boundary_ts: Option<i64> = None;
         for (ts, _) in q.iter() {
@@ -94,7 +107,11 @@ impl ChainlinkTracker {
         q.iter()
             .rev()
             .find(|(ts, _)| *ts == bt)
-            .map(|(_, p)| *p)
+            .map(|(ts, p)| (*ts, *p))
+    }
+
+    fn lookup_first_ge(&self, coin: Coin, t: i64) -> Option<Decimal> {
+        self.lookup_first_ge_with_ts(coin, t).map(|(_, p)| p)
     }
 
     /// Call when a round becomes active (same moment as inserting `active_rounds`).
@@ -102,18 +119,69 @@ impl ChainlinkTracker {
     /// Open and the previous round's close use the same boundary price: the first Chainlink print
     /// at/after `round_start`, taken from the rolling buffer when available so late registration
     /// still sees the correct open.
-    pub fn register_round(&self, coin: Coin, period: Period, round_start: i64, round_end: i64) {
-        let open = self.lookup_first_ge(coin, round_start);
+    ///
+    /// `api_opening_price` is the Polymarket/Gamma-reported open when the buffer only has ticks
+    /// from after the bot connected (mid-round start).
+    pub fn register_round(
+        &self,
+        coin: Coin,
+        period: Period,
+        round_start: i64,
+        round_end: i64,
+        api_opening_price: Option<Decimal>,
+    ) {
+        let buffer_ts_price = self.lookup_first_ge_with_ts(coin, round_start);
+        let (open, open_source) = match &buffer_ts_price {
+            Some((tick_ts, price)) if (tick_ts - round_start).abs() <= 2 => {
+                (Some(*price), Some(ChainlinkOpenSource::Buffer))
+            }
+            Some(_) => {
+                if let Some(api) = api_opening_price {
+                    (Some(api), Some(ChainlinkOpenSource::ApiFallback))
+                } else {
+                    (
+                        buffer_ts_price.map(|(_, p)| p),
+                        Some(ChainlinkOpenSource::StaleBuffer),
+                    )
+                }
+            }
+            None => {
+                if let Some(api) = api_opening_price {
+                    (Some(api), Some(ChainlinkOpenSource::ApiFallback))
+                } else {
+                    (None, None)
+                }
+            }
+        };
+
+        let source_tag = match (&buffer_ts_price, api_opening_price.is_some()) {
+            (Some((tick_ts, _)), _) if (tick_ts - round_start).abs() <= 2 => "buffer",
+            (Some(_), true) => "api_fallback",
+            (Some(_), false) => "stale_buffer_fallback",
+            (None, true) => "api_fallback",
+            (None, false) => "none",
+        };
+
         self.rounds.insert(
             (coin, period, round_start),
             RoundChainlink {
                 round_end,
                 open,
+                open_source,
                 close: None,
             },
         );
         if let Some(p) = open {
             self.set_previous_round_close_to_boundary_price(coin, period, round_start, p);
+        }
+        if let Some(open_price) = open {
+            info!(
+                coin = ?coin,
+                round_start,
+                open = %open_price,
+                source = source_tag,
+                "Chainlink opening price at registration"
+            );
         }
         debug!(
             coin = ?coin,
@@ -164,36 +232,98 @@ impl ChainlinkTracker {
             if c != coin {
                 continue;
             }
-            let st = ent.value_mut();
+            let round_end = ent.value().round_end;
+
             // Opening: first buffered price at/after round start (buffer includes this tick).
             // Refine when the same-second boundary gets a newer quote after `register_round`.
-            if tick_secs >= round_start && tick_secs < st.round_end {
-                let open_price = self
-                    .lookup_first_ge(coin, round_start)
-                    .unwrap_or(value);
-                let first_set = st.open.is_none();
-                if first_set || st.open != Some(open_price) {
-                    st.open = Some(open_price);
-                    if first_set {
-                        info!(
-                            coin = ?coin,
-                            round_start,
-                            open = %open_price,
-                            "Chainlink opening price captured"
-                        );
+            if tick_secs >= round_start && tick_secs < round_end {
+                let boundary = self.lookup_first_ge_with_ts(coin, round_start);
+                let boundary_is_genuine = boundary
+                    .map(|(ts, _)| (ts - round_start).abs() <= 2)
+                    .unwrap_or(false);
+                let lookup_price = self.lookup_first_ge(coin, round_start).unwrap_or(value);
+
+                let mut applied_open_update = false;
+                let mut price_for_prev: Option<Decimal> = None;
+
+                {
+                    let st = ent.value_mut();
+                    match st.open_source {
+                        Some(ChainlinkOpenSource::Buffer) => {
+                            let first_set = st.open.is_none();
+                            if first_set || st.open != Some(lookup_price) {
+                                st.open = Some(lookup_price);
+                                applied_open_update = true;
+                                price_for_prev = Some(lookup_price);
+                                if first_set {
+                                    info!(
+                                        coin = ?coin,
+                                        round_start,
+                                        open = %lookup_price,
+                                        "Chainlink opening price captured"
+                                    );
+                                }
+                            }
+                        }
+                        Some(ChainlinkOpenSource::ApiFallback)
+                        | Some(ChainlinkOpenSource::StaleBuffer) => {
+                            if boundary_is_genuine {
+                                let price_changed = st.open != Some(lookup_price);
+                                if price_changed {
+                                    st.open = Some(lookup_price);
+                                }
+                                st.open_source = Some(ChainlinkOpenSource::Buffer);
+                                if price_changed {
+                                    applied_open_update = true;
+                                    price_for_prev = Some(lookup_price);
+                                }
+                            }
+                        }
+                        None => {
+                            if st.open.is_none() {
+                                let src = if boundary_is_genuine {
+                                    ChainlinkOpenSource::Buffer
+                                } else {
+                                    ChainlinkOpenSource::StaleBuffer
+                                };
+                                st.open = Some(lookup_price);
+                                st.open_source = Some(src);
+                                applied_open_update = true;
+                                price_for_prev = Some(lookup_price);
+                                info!(
+                                    coin = ?coin,
+                                    round_start,
+                                    open = %lookup_price,
+                                    "Chainlink opening price captured"
+                                );
+                            } else if st.open != Some(lookup_price) {
+                                // Defensive: open without source — treat like buffer refinement.
+                                st.open = Some(lookup_price);
+                                st.open_source = Some(ChainlinkOpenSource::Buffer);
+                                applied_open_update = true;
+                                price_for_prev = Some(lookup_price);
+                            }
+                        }
                     }
-                    drop(ent);
-                    self.set_previous_round_close_to_boundary_price(coin, p, round_start, open_price);
+                }
+
+                if applied_open_update {
+                    if let Some(px) = price_for_prev {
+                        self.set_previous_round_close_to_boundary_price(coin, p, round_start, px);
+                    }
                     continue;
                 }
             }
             // Closing: first tick at/after round end if we never got a successor round's open
             // (e.g. bot stopped before the next round was registered). Use the same boundary rule as
             // `lookup_first_ge` (last quote at the boundary second), not the raw first tick value.
-            if tick_secs >= st.round_end && st.close.is_none() {
-                st.close = self
-                    .lookup_first_ge(coin, st.round_end)
-                    .or(Some(value));
+            if tick_secs >= round_end {
+                let st = ent.value_mut();
+                if st.close.is_none() {
+                    st.close = self
+                        .lookup_first_ge(coin, round_end)
+                        .or(Some(value));
+                }
             }
         }
     }
@@ -235,7 +365,15 @@ impl ChainlinkTracker {
         let entry = self.rounds.get(&key)?;
 
         let (open, open_source) = match entry.open {
-            Some(o) => (o, "stored"),
+            Some(o) => (
+                o,
+                match entry.open_source {
+                    Some(ChainlinkOpenSource::Buffer) => "stored_buffer",
+                    Some(ChainlinkOpenSource::ApiFallback) => "stored_api_fallback",
+                    Some(ChainlinkOpenSource::StaleBuffer) => "stored_stale_buffer",
+                    None => "stored",
+                },
+            ),
             None => (
                 self.lookup_first_ge(coin, round_start)?,
                 "buffer_lookup",
@@ -281,6 +419,18 @@ impl ChainlinkTracker {
         self.rounds
             .get(&(coin, period, round_start))
             .and_then(|r| r.open)
+    }
+
+    /// How the round open was chosen (for telemetry).
+    pub fn chainlink_open_source_for_round(
+        &self,
+        coin: Coin,
+        period: Period,
+        round_start: i64,
+    ) -> Option<ChainlinkOpenSource> {
+        self.rounds
+            .get(&(coin, period, round_start))
+            .and_then(|r| r.open_source)
     }
 
     /// Open and close used for settlement logging (call after [`Self::try_resolve_outcome`] succeeds, before [`Self::remove_round`]).
@@ -465,7 +615,7 @@ mod tests {
         let period = Period::Five;
         let rs = 1000;
         let re = rs + period.as_seconds();
-        t.register_round(coin, period, rs, re);
+        t.register_round(coin, period, rs, re, None);
         t.on_tick(coin, dec!(100), rs);
         t.on_tick(coin, dec!(101), re);
         assert_eq!(
@@ -481,7 +631,7 @@ mod tests {
         let period = Period::Five;
         let rs = 2000;
         let re = rs + period.as_seconds();
-        t.register_round(coin, period, rs, re);
+        t.register_round(coin, period, rs, re, None);
         t.on_tick(coin, dec!(200), rs);
         t.on_tick(coin, dec!(199), re);
         assert_eq!(
@@ -497,7 +647,7 @@ mod tests {
         let period = Period::Five;
         let rs = 3000;
         let re = rs + period.as_seconds();
-        t.register_round(coin, period, rs, re);
+        t.register_round(coin, period, rs, re, None);
         t.on_tick(coin, dec!(50), rs);
         t.on_tick(coin, dec!(50), re);
         assert_eq!(
@@ -516,7 +666,7 @@ mod tests {
         let re_n = rs_n + period.as_seconds();
         let rs_next = re_n;
 
-        t.register_round(coin, period, rs_n, re_n);
+        t.register_round(coin, period, rs_n, re_n, None);
         t.on_tick(coin, dec!(89.648), rs_n);
 
         // Stale / drift: ticks after round end before next round is registered would have
@@ -524,7 +674,7 @@ mod tests {
         t.on_tick(coin, dec!(80.0), re_n);
         t.on_tick(coin, dec!(81.0), re_n + 30);
 
-        t.register_round(coin, period, rs_next, rs_next + period.as_seconds());
+        t.register_round(coin, period, rs_next, rs_next + period.as_seconds(), None);
 
         // Boundary: first print in N+1 window defines both N's close and N+1's open.
         t.on_tick(coin, dec!(89.689), rs_next);
@@ -544,7 +694,7 @@ mod tests {
         let period = Period::Five;
         let rs = 10_000_000_i64;
         let re = rs + period.as_seconds();
-        t.register_round(coin, period, rs, re);
+        t.register_round(coin, period, rs, re, None);
         t.on_tick(coin, dec!(70298.43), rs);
         t.on_tick(coin, dec!(70354.93), re);
 
@@ -569,7 +719,7 @@ mod tests {
         t.on_tick(coin, dec!(100), rs);
         t.on_tick(coin, dec!(999), rs + 660);
 
-        t.register_round(coin, period, rs, re);
+        t.register_round(coin, period, rs, re, None);
         t.on_tick(coin, dec!(101), re);
 
         assert_eq!(

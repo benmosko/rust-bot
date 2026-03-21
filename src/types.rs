@@ -107,6 +107,8 @@ pub struct Market {
     pub up_best_ask: Option<Decimal>,
     pub down_best_bid: Option<Decimal>,
     pub down_best_ask: Option<Decimal>,
+    /// Polymarket/Gamma-reported Chainlink open for the round (when present). Used to fix mid-round bot starts.
+    pub opening_price: Option<Decimal>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
