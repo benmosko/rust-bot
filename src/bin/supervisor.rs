@@ -526,7 +526,7 @@ impl Supervisor {
              /stop or /stopbot — stop the bot\n\
              /restart — stop then start\n\
              /status — bot PID / uptime + latest log mtime\n\
-             /balance — on-chain USDC (TELEGRAM_BALANCE_ADDRESS or FUNDER_ADDRESS / FUNDER)\n\
+             /balance — on-chain USDC (same wallet as bot: funder or EOA from .env)\n\
              /pnl — latest session P&L from {} (session id shown)\n\
              /stats — latest session stats from DB (session id + note)\n\
              /dashboard — balance + bot status + DB stats + Live dashboard button if TELEGRAM_WEBAPP_PUBLIC_URL is set\n\

@@ -117,8 +117,8 @@ $env:RUST_LOG="info"; $env:STRATEGY_MODE="sniper_only"; cargo run --profile rele
 
 ## Wallet
 - Do not commit real addresses or keys; use `.env` / `polymarket_keys.env` (gitignored).
-- `FUNDER_ADDRESS` / `FUNDER`: proxy or Safe that holds USDC (`SIGNATURE_TYPE=2`).
-- Optional `TELEGRAM_BALANCE_ADDRESS`: same as funder if unset; used for Telegram `/balance`.
+- `FUNDER_ADDRESS` / `FUNDER`: proxy or Safe that holds USDC (`SIGNATURE_TYPE=2`); required for Safe trading.
+- Telegram `/balance` uses the same wallet as on-chain balance: optional `TELEGRAM_BALANCE_ADDRESS`, else funder, else EOA from `PK`.
 - `SIGNATURE_TYPE=2` for Gnosis Safe
 
 ## Current Strategy

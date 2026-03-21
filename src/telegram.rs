@@ -3,6 +3,7 @@
 use crate::balance::fetch_usdc_balance;
 use crate::execution::ExecutionEngine;
 use crate::types::{Coin, Period, RoundHistoryEntry, RoundHistoryStatus};
+use polymarket_client_sdk::auth::LocalSigner;
 use polymarket_client_sdk::types::Address;
 use reqwest::Client;
 use rust_decimal::prelude::ToPrimitive;
@@ -137,19 +138,30 @@ pub fn query_session_pnl(
         .map_err(|e| e.to_string())
 }
 
-/// Wallet for Telegram `/balance` and dashboard balance line: `TELEGRAM_BALANCE_ADDRESS`, else `FUNDER_ADDRESS` / `FUNDER` (never hardcode addresses in repo).
+/// Wallet for Telegram `/balance` and dashboard balance line — same resolution as the bot’s `BalanceManager`:
+/// optional `TELEGRAM_BALANCE_ADDRESS`, else non-empty `FUNDER` / `FUNDER_ADDRESS`, else EOA from `PK` / `POLYMARKET_PRIVATE_KEY`.
 pub fn telegram_balance_wallet_from_env() -> Result<Address, String> {
-    let s = std::env::var("TELEGRAM_BALANCE_ADDRESS")
-        .or_else(|_| std::env::var("FUNDER_ADDRESS"))
-        .or_else(|_| std::env::var("FUNDER"))
-        .map_err(|_| {
-            "Set TELEGRAM_BALANCE_ADDRESS or FUNDER_ADDRESS (or FUNDER) for Telegram /balance".to_string()
-        })?;
-    let s = s.trim();
-    if s.is_empty() {
-        return Err("TELEGRAM_BALANCE_ADDRESS / FUNDER is empty".to_string());
+    dotenv::dotenv().ok();
+    dotenv::from_filename("polymarket_keys.env").ok();
+
+    if let Ok(s) = std::env::var("TELEGRAM_BALANCE_ADDRESS") {
+        let s = s.trim();
+        if !s.is_empty() {
+            return Address::from_str(s).map_err(|e| format!("Invalid TELEGRAM_BALANCE_ADDRESS: {e}"));
+        }
     }
-    Address::from_str(s).map_err(|e| format!("Invalid balance wallet address: {e}"))
+    if let Ok(s) = std::env::var("FUNDER").or_else(|_| std::env::var("FUNDER_ADDRESS")) {
+        let s = s.trim();
+        if !s.is_empty() {
+            return Address::from_str(s).map_err(|e| format!("Invalid FUNDER_ADDRESS: {e}"));
+        }
+    }
+    let pk = std::env::var("PK")
+        .or_else(|_| std::env::var("POLYMARKET_PRIVATE_KEY"))
+        .map_err(|_| "PK or POLYMARKET_PRIVATE_KEY required".to_string())?;
+    let signer =
+        LocalSigner::from_str(pk.trim()).map_err(|e| format!("Invalid private key: {e}"))?;
+    Ok(signer.address())
 }
 
 #[derive(Clone)]
