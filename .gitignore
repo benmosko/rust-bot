@@ -5,6 +5,9 @@ target/
 *.env
 !.env.example
 
+# SSH private keys (never commit)
+*.pem
+
 # IDE files
 .idea/
 .vscode/
