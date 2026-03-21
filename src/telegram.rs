@@ -137,8 +137,20 @@ pub fn query_session_pnl(
         .map_err(|e| e.to_string())
 }
 
-/// `/balance` command: fixed proxy wallet from project docs.
-const BALANCE_PROXY_WALLET: &str = "0xD6d35B777089235c9CCDcD4830BF1BBda2A06300";
+/// Wallet for Telegram `/balance` and dashboard balance line: `TELEGRAM_BALANCE_ADDRESS`, else `FUNDER_ADDRESS` / `FUNDER` (never hardcode addresses in repo).
+pub fn telegram_balance_wallet_from_env() -> Result<Address, String> {
+    let s = std::env::var("TELEGRAM_BALANCE_ADDRESS")
+        .or_else(|_| std::env::var("FUNDER_ADDRESS"))
+        .or_else(|_| std::env::var("FUNDER"))
+        .map_err(|_| {
+            "Set TELEGRAM_BALANCE_ADDRESS or FUNDER_ADDRESS (or FUNDER) for Telegram /balance".to_string()
+        })?;
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("TELEGRAM_BALANCE_ADDRESS / FUNDER is empty".to_string());
+    }
+    Address::from_str(s).map_err(|e| format!("Invalid balance wallet address: {e}"))
+}
 
 #[derive(Clone)]
 pub struct TelegramBot {
@@ -734,7 +746,7 @@ fn web_app_keyboard(
 }
 
 async fn cmd_balance(rpc_url: &str) -> Result<TelegramReply, String> {
-    let addr = Address::from_str(BALANCE_PROXY_WALLET).map_err(|e| e.to_string())?;
+    let addr = telegram_balance_wallet_from_env()?;
     let bal = fetch_usdc_balance(rpc_url, addr)
         .await
         .map_err(|e| e.to_string())?;
@@ -899,7 +911,7 @@ async fn cmd_dashboard(
     session_start: chrono::DateTime<chrono::Utc>,
     dashboard: &TelegramDashboardState,
 ) -> Result<TelegramReply, String> {
-    let addr = Address::from_str(BALANCE_PROXY_WALLET).map_err(|e| e.to_string())?;
+    let addr = telegram_balance_wallet_from_env()?;
     let bal = fetch_usdc_balance(rpc_url, addr)
         .await
         .map_err(|e| e.to_string())?;

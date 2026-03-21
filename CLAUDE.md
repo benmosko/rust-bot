@@ -116,7 +116,9 @@ $env:RUST_LOG="info"; $env:STRATEGY_MODE="sniper_only"; cargo run --profile rele
 - On Windows: rolling file may be UTF-16; tail/parse accordingly
 
 ## Wallet
-- Proxy/Safe: `0xD6d35B777089235c9CCDcD4830BF1BBda2A06300` (example)
+- Do not commit real addresses or keys; use `.env` / `polymarket_keys.env` (gitignored).
+- `FUNDER_ADDRESS` / `FUNDER`: proxy or Safe that holds USDC (`SIGNATURE_TYPE=2`).
+- Optional `TELEGRAM_BALANCE_ADDRESS`: same as funder if unset; used for Telegram `/balance`.
 - `SIGNATURE_TYPE=2` for Gnosis Safe
 
 ## Current Strategy

@@ -49,6 +49,12 @@ cargo run --profile release-fast --bin polymarket-bot
 - **Maker only** – All orders are maker; no taker fees; rebates apply.
 - **Fee rate** – Fetched per token via API; SDK includes it in order signatures. Do not hardcode.
 
+## Security
+
+- Never commit `.env`, `polymarket_keys.env`, or keys/tokens. They are listed in `.gitignore`.
+- If a key or bot token was ever pushed, rotate it (new Telegram token via @BotFather, new wallet key if compromised).
+- Telegram `/balance` reads `TELEGRAM_BALANCE_ADDRESS` or your `FUNDER` / `FUNDER_ADDRESS` — no wallet addresses belong in the source tree.
+
 ## License
 
 Use at your own risk. Not financial advice.

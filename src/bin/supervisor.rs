@@ -7,7 +7,6 @@
 use std::collections::HashSet;
 use std::path::Path;
 use std::process::Stdio;
-use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 fn format_duration_hms(d: Duration) -> String {
@@ -28,17 +27,13 @@ use chrono::{DateTime, Local};
 use polymarket_bot::balance::fetch_usdc_balance;
 use polymarket_bot::telegram::{
     query_session_pnl, query_session_stats, resolve_session_id_for_supervisor,
-    webapp_dashboard_url_from_env, SessionStatsSnapshot,
+    telegram_balance_wallet_from_env, webapp_dashboard_url_from_env, SessionStatsSnapshot,
 };
-use polymarket_client_sdk::types::Address;
 use reqwest::Client;
 use rust_decimal::prelude::ToPrimitive;
 use serde::Deserialize;
 use tokio::process::{Child, Command};
 use tokio::time::sleep;
-
-/// `/balance` command: fixed proxy wallet from project docs (same as `telegram.rs`).
-const BALANCE_PROXY_WALLET: &str = "0xD6d35B777089235c9CCDcD4830BF1BBda2A06300";
 
 /// Inline WebApp button for the same Mini App URL `polymarket-bot` uses on startup (if env is set).
 fn telegram_webapp_dashboard_markup() -> Option<serde_json::Value> {
@@ -379,9 +374,9 @@ impl Supervisor {
     }
 
     async fn cmd_balance(&self) -> String {
-        let addr = match Address::from_str(BALANCE_PROXY_WALLET) {
+        let addr = match telegram_balance_wallet_from_env() {
             Ok(a) => a,
-            Err(e) => return format!("Balance error: {}", e),
+            Err(e) => return format!("Balance: {}", e),
         };
         match fetch_usdc_balance(&self.rpc_url, addr).await {
             Ok(b) => {
@@ -531,7 +526,7 @@ impl Supervisor {
              /stop or /stopbot — stop the bot\n\
              /restart — stop then start\n\
              /status — bot PID / uptime + latest log mtime\n\
-             /balance — on-chain USDC (proxy wallet)\n\
+             /balance — on-chain USDC (TELEGRAM_BALANCE_ADDRESS or FUNDER_ADDRESS / FUNDER)\n\
              /pnl — latest session P&L from {} (session id shown)\n\
              /stats — latest session stats from DB (session id + note)\n\
              /dashboard — balance + bot status + DB stats + Live dashboard button if TELEGRAM_WEBAPP_PUBLIC_URL is set\n\
