@@ -458,10 +458,12 @@ fn infer_up_won_from_prices_and_labels(prices: &[f64], labels: &[String]) -> Opt
     if p_up == 0.0 && p_down == 0.0 {
         return None;
     }
-    if p_up > 0.9 && p_down < 0.1 {
+    // Strict band: same outcome Polymarket shows when a side is effectively settled (claimable).
+    // `closed` in JSON often lags these prices — we finalize on prices alone so you see WON/LOST ~within 1m.
+    if p_up > 0.95 && p_down < 0.05 {
         return Some(true);
     }
-    if p_down > 0.9 && p_up < 0.1 {
+    if p_down > 0.95 && p_up < 0.05 {
         return Some(false);
     }
     None
@@ -677,24 +679,23 @@ fn finalize_open_round_resolution(
     );
 }
 
-/// Backoff for Gamma-only polling: aggressive right after `round_end` (official `closed` often appears
-/// within 1–3 minutes; we want to notice it as soon as Polymarket’s API reflects it).
+/// Backoff for Gamma polling: **1s** for the first minute after `round_end`, then relaxes.
 fn gamma_poll_interval_secs(round_start: i64, period: Period) -> u64 {
     let round_end = round_start + period.as_seconds();
     let now = Utc::now().timestamp();
     let after_end = now.saturating_sub(round_end);
-    if after_end < 120 {
-        3
+    if after_end < 60 {
+        1
     } else if after_end < 600 {
-        10
+        5
     } else {
-        30
+        20
     }
 }
 
-/// Settle OPEN round_history rows from **Gamma only** (CTF-aligned with what you can claim on Polymarket).
-/// RTDS Chainlink can disagree with redeemable outcomes — we no longer finalize P&L from Chainlink.
-/// Fast [`gamma_poll_interval_secs`] polling covers the gap when Gamma lags after `round_end`.
+/// Settle OPEN rows from **Gamma only** (same source as the app: `outcomePrices` + `closed`).
+/// Finalizes as soon as [`infer_up_won_from_prices_and_labels`] returns `Some` — often **before** `closed=true`.
+/// [`gamma_poll_interval_secs`] polls every **1s** in the first **60s** after `round_end` to catch flips quickly.
 pub async fn resolve_round_history_open_entries_chainlink_or_gamma(
     tracker: Option<Arc<ChainlinkTracker>>,
     client: &reqwest::Client,
@@ -730,8 +731,14 @@ pub async fn resolve_round_history_open_entries_chainlink_or_gamma(
     }
 
     match fetch_market_resolution_by_slug(client, slug).await {
-        Ok(Some(gamma_res)) if gamma_res.closed => {
+        Ok(Some(gamma_res)) => {
             if let Some(up_won) = gamma_res.up_won {
+                info!(
+                    slug = %slug,
+                    closed = gamma_res.closed,
+                    up_won,
+                    "Gamma: decisive outcomePrices (finalize; closed flag may still lag)"
+                );
                 let outcome = if up_won {
                     ChainlinkOutcome::UpWon
                 } else {
@@ -753,26 +760,6 @@ pub async fn resolve_round_history_open_entries_chainlink_or_gamma(
                 );
                 return;
             }
-            // `closed` but outcomePrices still ambiguous — poll Gamma until winner is inferable.
-            resolve_round_history_open_entries_gamma(
-                client,
-                round_history,
-                condition_id,
-                slug,
-                round_start,
-                shutdown,
-                tracker,
-                coin,
-                period,
-                strategy_logger,
-                spot_feeds,
-                telegram,
-            )
-            .await;
-            return;
-        }
-        Ok(Some(_gamma_not_closed)) => {
-            // Gamma has not finalized yet — poll until `closed` + prices (Chainlink P&L disabled; can disagree with CTF).
             resolve_round_history_open_entries_gamma(
                 client,
                 round_history,
@@ -817,8 +804,8 @@ pub async fn resolve_round_history_open_entries_chainlink_or_gamma(
     .await;
 }
 
-/// Poll Gamma until the market is resolved (`closed` + `outcomePrices`), then set OPEN rows to WON/LOST.
-/// Interval starts at 3s after `round_end`, then 10s, then 30s (see [`gamma_poll_interval_secs`]).
+/// Poll Gamma until outcome prices are decisive (see [`infer_up_won_from_prices_and_labels`]).
+/// Interval: 1s for 60s after `round_end`, then 5s / 20s (see [`gamma_poll_interval_secs`]).
 /// Stops on `shutdown` or once all matching OPEN rows are settled.
 pub async fn resolve_round_history_open_entries_gamma(
     client: &reqwest::Client,
@@ -875,29 +862,27 @@ pub async fn resolve_round_history_open_entries_gamma(
                     outcome = ?res.up_won,
                     "Gamma resolution result"
                 );
-                if res.closed {
-                    if let Some(up_won) = res.up_won {
-                        let outcome = if up_won {
-                            ChainlinkOutcome::UpWon
-                        } else {
-                            ChainlinkOutcome::DownWon
-                        };
-                        finalize_open_round_resolution(
-                            outcome,
-                            tracker.as_ref(),
-                            round_history,
-                            coin,
-                            period,
-                            round_start,
-                            condition_id,
-                            slug,
-                            &strategy_logger,
-                            &spot_feeds,
-                            &telegram,
-                            "gamma_poll",
-                        );
-                        return;
-                    }
+                if let Some(up_won) = res.up_won {
+                    let outcome = if up_won {
+                        ChainlinkOutcome::UpWon
+                    } else {
+                        ChainlinkOutcome::DownWon
+                    };
+                    finalize_open_round_resolution(
+                        outcome,
+                        tracker.as_ref(),
+                        round_history,
+                        coin,
+                        period,
+                        round_start,
+                        condition_id,
+                        slug,
+                        &strategy_logger,
+                        &spot_feeds,
+                        &telegram,
+                        "gamma_poll",
+                    );
+                    return;
                 }
                 debug!(
                     condition_id = %condition_id,
