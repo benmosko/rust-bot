@@ -1,4 +1,7 @@
-use crate::types::{Coin, Market, Period};
+use crate::rtds_chainlink::{ChainlinkOutcome, ChainlinkTracker};
+use crate::strategy_log::StrategyLogger;
+use crate::telegram::TelegramBot;
+use crate::types::{Coin, Market, Period, RoundHistoryEntry, RoundHistoryStatus, SpotState};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use rust_decimal::Decimal;
@@ -7,7 +10,12 @@ use serde::Deserialize;
 use serde_json;
 use std::collections::HashMap;
 use std::str::FromStr;
-use tracing::{debug, error, warn};
+use std::sync::{Arc, Mutex};
+use tokio::sync::watch;
+use tokio::time::{sleep, Duration};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn};
+use rust_decimal::prelude::ToPrimitive;
 
 const GAMMA_API_BASE: &str = "https://gamma-api.polymarket.com";
 
@@ -94,12 +102,12 @@ pub fn calculate_round_end(period: Period, round_start: i64) -> i64 {
 }
 
 pub async fn fetch_market(
+    client: &reqwest::Client,
     coin: Coin,
     period: Period,
     round_start: i64,
 ) -> Result<Market> {
     let slug = generate_slug(coin, period, round_start);
-    let client = reqwest::Client::new();
 
     // Try with original slug first
     let url = format!("{}/events?slug={}", GAMMA_API_BASE, slug);
@@ -236,6 +244,12 @@ pub async fn fetch_market(
         .context("No Down token found")?
         .clone();
 
+    // DEBUG: Log token mapping
+    info!(
+        "Token mapping: outcomes={:?}, clobTokenIds={:?}, up_token_id={}, down_token_id={}",
+        outcomes, clob_token_ids, up_token_id, down_token_id
+    );
+
     // Parse minimum tick size - construct from string to avoid f64 floating point artifacts
     // All our crypto up/down markets use tick_size 0.01, so hardcode for safety
     let minimum_tick_size = Decimal::from_str("0.01")
@@ -326,10 +340,422 @@ pub async fn discover_active_rounds(
 
 #[allow(dead_code)]
 pub async fn pre_fetch_next_round(
+    client: &reqwest::Client,
     coin: Coin,
     period: Period,
     current_round_start: i64,
 ) -> Result<Market> {
     let next_round_start = current_round_start + period.as_seconds();
-    fetch_market(coin, period, next_round_start).await
+    fetch_market(client, coin, period, next_round_start).await
+}
+
+/// Parsed Gamma `/markets?slug=…` row: resolution state for winner inference.
+#[derive(Debug, Clone)]
+pub struct GammaMarketResolution {
+    pub closed: bool,
+    /// `true` = outcome index 0 (Up / YES) won; `false` = index 1 (Down / NO) won.
+    pub up_won: Option<bool>,
+}
+
+fn gamma_outcome_prices_as_f64(m: &serde_json::Value) -> Vec<f64> {
+    let raw: Option<Vec<serde_json::Value>> = match m.get("outcomePrices") {
+        Some(serde_json::Value::String(s)) => serde_json::from_str(s).ok(),
+        Some(serde_json::Value::Array(a)) => Some(a.clone()),
+        _ => None,
+    };
+    raw.unwrap_or_default()
+        .iter()
+        .filter_map(|v| match v {
+            serde_json::Value::String(s) => s.parse::<f64>().ok(),
+            serde_json::Value::Number(n) => n.as_f64(),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Infer winner from resolved outcome prices (long decimals, not exactly `"1"`).
+/// Returns `None` if resolution data is not ready yet or ambiguous.
+fn infer_up_won_from_outcome_prices(prices: &[f64]) -> Option<bool> {
+    let (p0, p1) = match (prices.first(), prices.get(1)) {
+        (Some(a), Some(b)) => (*a, *b),
+        _ => return None,
+    };
+    // Both zero → market data not settled in Gamma yet; retry later.
+    if p0 == 0.0 && p1 == 0.0 {
+        return None;
+    }
+    // Index 0 = Up/Yes, 1 = Down/No: winning side ≈1, losing side ≈0 (never exact strings).
+    if p0 > 0.9 && p1 < 0.1 {
+        return Some(true);
+    }
+    if p1 > 0.9 && p0 < 0.1 {
+        return Some(false);
+    }
+    None
+}
+
+/// GET `https://gamma-api.polymarket.com/markets?slug={slug}` — uses `outcomePrices` and `closed`.
+/// Slug uniquely identifies the crypto UP/DOWN market; `condition_id` queries return unrelated rows.
+pub async fn fetch_market_resolution_by_slug(
+    client: &reqwest::Client,
+    slug: &str,
+) -> Result<Option<GammaMarketResolution>> {
+    let url = format!("{}/markets", GAMMA_API_BASE);
+    let response = client
+        .get(&url)
+        .query(&[("slug", slug)])
+        .send()
+        .await
+        .context("Gamma markets fetch failed")?;
+
+    if !response.status().is_success() {
+        warn!(
+            status = %response.status(),
+            slug = %slug,
+            "Gamma markets resolution fetch non-success"
+        );
+        return Ok(None);
+    }
+
+    let v: serde_json::Value = response
+        .json()
+        .await
+        .context("Gamma markets JSON parse failed")?;
+
+    let arr: &[serde_json::Value] = match &v {
+        serde_json::Value::Array(a) => a.as_slice(),
+        _ => &[],
+    };
+    let m = match arr.first() {
+        Some(x) => x,
+        None => return Ok(None),
+    };
+
+    let closed = m.get("closed").and_then(|x| x.as_bool()).unwrap_or(false);
+
+    let outcome_prices_raw = m.get("outcomePrices");
+    let outcomes_raw = m.get("outcomes");
+    info!(
+        "Gamma raw response: slug={}, closed={}, outcomePrices={:?}, outcomes={:?}",
+        slug, closed, outcome_prices_raw, outcomes_raw
+    );
+
+    let prices = gamma_outcome_prices_as_f64(m);
+    let up_won = infer_up_won_from_outcome_prices(&prices);
+
+    Ok(Some(GammaMarketResolution { closed, up_won }))
+}
+
+fn apply_up_won_to_open_round_history(
+    round_history: &Arc<Mutex<Vec<RoundHistoryEntry>>>,
+    condition_id: &str,
+    round_start: i64,
+    up_won: bool,
+) {
+    let outcome = if up_won {
+        ChainlinkOutcome::UpWon
+    } else {
+        ChainlinkOutcome::DownWon
+    };
+    apply_chainlink_outcome_to_open_round_history(round_history, condition_id, round_start, outcome);
+}
+
+/// Chainlink-style resolution: UP / DOWN / tie (no movement). Gamma only gives a binary winner.
+fn apply_chainlink_outcome_to_open_round_history(
+    round_history: &Arc<Mutex<Vec<RoundHistoryEntry>>>,
+    condition_id: &str,
+    round_start: i64,
+    outcome: ChainlinkOutcome,
+) {
+    let mut g = match round_history.lock() {
+        Ok(g) => g,
+        Err(e) => {
+            error!(error = %e, "round_history mutex poisoned; skip resolution P&L update");
+            return;
+        }
+    };
+    for e in g.iter_mut() {
+        if e.condition_id != condition_id || e.round_start != round_start {
+            continue;
+        }
+        if e.status != RoundHistoryStatus::Open {
+            continue;
+        }
+        let won = match outcome {
+            ChainlinkOutcome::UpWon => e.side_label == "UP",
+            ChainlinkOutcome::DownWon => e.side_label == "DOWN",
+            ChainlinkOutcome::Tie => false,
+        };
+        // Explicit realized P&L for unhedged legs (must match TUI session sum).
+        let pnl = if won {
+            e.pnl_if_resolved_won()
+        } else {
+            e.pnl_if_resolved_lost()
+        };
+        e.pnl = Some(pnl);
+        e.status = if won {
+            RoundHistoryStatus::Won
+        } else {
+            RoundHistoryStatus::Lost
+        };
+        info!(
+            "Round resolved: coin={}, side={}, outcome={:?}, status={:?}, pnl={:?}",
+            e.coin.as_str(),
+            e.side_label,
+            outcome,
+            e.status,
+            e.pnl,
+        );
+    }
+}
+
+/// Prefer Chainlink (RTDS) open/close for the round; if unavailable, poll Gamma.
+pub async fn resolve_round_history_open_entries_chainlink_or_gamma(
+    tracker: Option<Arc<ChainlinkTracker>>,
+    client: &reqwest::Client,
+    round_history: &Arc<Mutex<Vec<RoundHistoryEntry>>>,
+    coin: Coin,
+    period: Period,
+    condition_id: &str,
+    slug: &str,
+    round_start: i64,
+    shutdown: CancellationToken,
+    strategy_logger: Option<Arc<Mutex<StrategyLogger>>>,
+    spot_feeds: Option<Arc<HashMap<Coin, watch::Receiver<SpotState>>>>,
+    telegram: Arc<TelegramBot>,
+) {
+    let has_open = round_history
+        .lock()
+        .map(|g| {
+            g.iter().any(|e| {
+                e.condition_id == condition_id
+                    && e.round_start == round_start
+                    && e.status == RoundHistoryStatus::Open
+            })
+        })
+        .unwrap_or(false);
+    if !has_open {
+        info!(
+            condition_id = %condition_id,
+            slug = %slug,
+            round_start,
+            "resolution: no OPEN entries, skipping"
+        );
+        return;
+    }
+
+    if let Some(ref t) = tracker {
+        match t.try_resolve_outcome(coin, period, round_start) {
+            Some(outcome) => {
+                let prices = t.settlement_prices_for_round(coin, period, round_start);
+                apply_chainlink_outcome_to_open_round_history(
+                    round_history,
+                    condition_id,
+                    round_start,
+                    outcome,
+                );
+                let chainlink_close_f = prices
+                    .as_ref()
+                    .and_then(|(_, c)| c.to_f64())
+                    .unwrap_or(0.0);
+                let chainlink_open_f = prices
+                    .as_ref()
+                    .and_then(|(o, _)| o.to_f64())
+                    .unwrap_or(0.0);
+                if prices.is_none() {
+                    warn!(
+                        coin = ?coin,
+                        period = ?period,
+                        round_start,
+                        "strategy_log: settlement_prices_for_round missing after Chainlink resolve"
+                    );
+                }
+                if let Ok(rh) = round_history.lock() {
+                    for e in rh.iter() {
+                        if e.condition_id != condition_id || e.round_start != round_start {
+                            continue;
+                        }
+                        if e.status != RoundHistoryStatus::Won
+                            && e.status != RoundHistoryStatus::Lost
+                            && e.status != RoundHistoryStatus::Hedged
+                        {
+                            continue;
+                        }
+                        let position_outcome = if e.status == RoundHistoryStatus::Hedged {
+                            "HEDGED"
+                        } else if matches!(outcome, ChainlinkOutcome::Tie) {
+                            "TIE"
+                        } else {
+                            let matches_winning_side = match outcome {
+                                ChainlinkOutcome::UpWon => e.side_label == "UP",
+                                ChainlinkOutcome::DownWon => e.side_label == "DOWN",
+                                ChainlinkOutcome::Tie => unreachable!(),
+                            };
+                            if matches_winning_side {
+                                "WON"
+                            } else {
+                                "LOST"
+                            }
+                        };
+                        let pnl_f = e.pnl.and_then(|d| d.to_f64()).unwrap_or(0.0);
+                        if let (Some(sl), Some(spot_arc)) = (&strategy_logger, &spot_feeds) {
+                            let binance_spot_close = spot_arc
+                                .get(&coin)
+                                .map(|r| r.borrow().price)
+                                .and_then(|d| d.to_f64());
+                            if let Ok(guard) = sl.lock() {
+                                if let Err(err) = guard.log_resolution(
+                                    e.coin.as_str(),
+                                    &format!("{}m", e.period.as_minutes()),
+                                    e.round_start,
+                                    &e.side_label,
+                                    chainlink_close_f,
+                                    position_outcome,
+                                    pnl_f,
+                                    binance_spot_close,
+                                ) {
+                                    warn!(error = %err, "strategy_log log_resolution failed");
+                                }
+                            }
+                        }
+                        let entry_pf = e.entry_price.to_f64().unwrap_or(0.0);
+                        let time_left_u = (e.round_end - e.fill_time.timestamp()).max(0) as u64;
+                        telegram.send_round_resolution(
+                            e.coin.as_str(),
+                            &format!("{}m", e.period.as_minutes()),
+                            &e.side_label,
+                            entry_pf,
+                            position_outcome,
+                            pnl_f,
+                            chainlink_open_f,
+                            chainlink_close_f,
+                            time_left_u,
+                        );
+                    }
+                }
+                t.remove_round(coin, period, round_start);
+                info!(
+                    condition_id = %condition_id,
+                    slug = %slug,
+                    round_start,
+                    ?outcome,
+                    "Round history: Chainlink resolution applied for OPEN rows"
+                );
+                return;
+            }
+            None => {
+                warn!(
+                    coin = ?coin,
+                    period = ?period,
+                    round_start,
+                    "Chainlink resolution not ready (missing open/close or feed); falling back to Gamma"
+                );
+            }
+        }
+    }
+
+    resolve_round_history_open_entries_gamma(
+        client,
+        round_history,
+        condition_id,
+        slug,
+        round_start,
+        shutdown,
+    )
+    .await;
+}
+
+/// Poll Gamma until the market is resolved (`closed` + `outcomePrices`), then set OPEN rows to WON/LOST.
+/// Retries every 30s; stops on `shutdown` or once all matching OPEN rows are settled.
+pub async fn resolve_round_history_open_entries_gamma(
+    client: &reqwest::Client,
+    round_history: &Arc<Mutex<Vec<RoundHistoryEntry>>>,
+    condition_id: &str,
+    slug: &str,
+    round_start: i64,
+    shutdown: CancellationToken,
+) {
+    info!(
+        condition_id = %condition_id,
+        slug = %slug,
+        round_start,
+        "Gamma resolution task started"
+    );
+    let has_open = round_history
+        .lock()
+        .map(|g| {
+            g.iter()
+                .any(|e| {
+                    e.condition_id == condition_id
+                        && e.round_start == round_start
+                        && e.status == RoundHistoryStatus::Open
+                })
+        })
+        .unwrap_or(false);
+    if !has_open {
+        info!(
+            condition_id = %condition_id,
+            slug = %slug,
+            round_start,
+            "Gamma resolution: no OPEN entries, skipping"
+        );
+        return;
+    }
+
+    loop {
+        if shutdown.is_cancelled() {
+            return;
+        }
+
+        match fetch_market_resolution_by_slug(client, slug).await {
+            Ok(Some(res)) => {
+                info!(
+                    condition_id = %condition_id,
+                    slug = %slug,
+                    closed = res.closed,
+                    outcome = ?res.up_won,
+                    "Gamma resolution result"
+                );
+                if res.closed {
+                    if let Some(up_won) = res.up_won {
+                        apply_up_won_to_open_round_history(round_history, condition_id, round_start, up_won);
+                        info!(
+                            condition_id = %condition_id,
+                            slug = %slug,
+                            round_start,
+                            up_won,
+                            "Round history: Gamma resolution applied for OPEN rows"
+                        );
+                        return;
+                    }
+                }
+                debug!(
+                    condition_id = %condition_id,
+                    slug = %slug,
+                    closed = res.closed,
+                    "Gamma market not fully resolved yet; retry in 30s"
+                );
+            }
+            Ok(None) => {
+                debug!(
+                    condition_id = %condition_id,
+                    slug = %slug,
+                    "Gamma markets: empty response; retry in 30s"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    condition_id = %condition_id,
+                    slug = %slug,
+                    "Gamma resolution fetch error; retry in 30s"
+                );
+            }
+        }
+
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = sleep(Duration::from_secs(30)) => {}
+        }
+    }
 }

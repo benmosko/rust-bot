@@ -65,7 +65,12 @@ async fn run() -> Result<()> {
     let now = Utc::now().timestamp();
     let round_start = calculate_round_start(period, now);
     
-    let market = fetch_market(coin, period, round_start)
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(25))
+        .build()
+        .context("Failed to build HTTP client")?;
+
+    let market = fetch_market(&http, coin, period, round_start)
         .await
         .context("Failed to discover BTC 5m market")?;
     
@@ -74,10 +79,13 @@ async fn run() -> Result<()> {
         market.slug, market.up_token_id
     );
     
-    // Step 4: Place one maker BUY order for YES at $0.01 for 5 shares
-    println!("[4/6] Placing order: BUY YES @ $0.01 x 5 shares...");
+    // Step 4: Place one maker BUY order for YES at $0.01 (size from SNIPER_MIN_SHARES / config)
+    let size = config.sniper_min_shares;
+    println!(
+        "[4/6] Placing order: BUY YES @ $0.01 x {} shares (sniper_min_shares)...",
+        size
+    );
     let price = dec!(0.01);
-    let size = dec!(5);
     
     let order_id = execution
         .place_order(&market.up_token_id, Side::Buy, price, size, market.minimum_tick_size)

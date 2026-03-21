@@ -21,6 +21,8 @@ Thumbs.db
 *.log.*
 *_debug.txt
 bot_debug.txt
+logs/
+trade_summary*.txt
 
 # State files
 state.json

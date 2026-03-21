@@ -5,7 +5,8 @@ edition = "2021"
 
 [dependencies]
 polymarket-client-sdk = { version = "0.4", features = ["clob", "ws", "data"] }
-tokio = { version = "1", features = ["full"] }
+# `full` pulls in many unused modules; explicit features cut compile time a lot.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -13,7 +14,9 @@ rust_decimal = "1"
 rust_decimal_macros = "1"
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+tracing-log = "0.2"
+log = "0.4"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 thiserror = "2"
 dotenv = "0.15"
@@ -24,12 +27,36 @@ url = "2"
 dashmap = "6"
 tokio-util = "0.7"
 tracing-appender = "0.2"
+rusqlite = { version = "0.32", features = ["bundled"] }
 ecdsa = "0.16"
 k256 = "0.13"
 alloy = { version = "1.7", features = ["provider-http", "contract", "sol-types"] }
 ratatui = "0.29"
 crossterm = "0.28"
+hex = "0.4"
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors"] }
+hmac = "0.12"
+sha2 = "0.10"
 
 [[bin]]
 name = "test-order"
 path = "src/bin/test_order.rs"
+
+# ---- Faster iteration ----
+# Dev: less debug info = quicker compiles; stack traces still have file/line.
+[profile.dev]
+debug = 1
+incremental = true
+
+# Release: faster link + no LTO. Incremental speeds rebuilds of this crate.
+[profile.release]
+codegen-units = 256
+lto = false
+incremental = true
+
+# Even faster compile than default `release` (opt 3): slightly slower binary.
+# Use: cargo build --profile release-fast --bin polymarket-bot
+[profile.release-fast]
+inherits = "release"
+opt-level = 2

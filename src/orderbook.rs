@@ -1,16 +1,31 @@
 use crate::types::OrderbookState;
-use anyhow::{Context, Result};
-use chrono::Utc;
+use anyhow::Result;
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
+use polymarket_client_sdk::clob::ws::{BookUpdate, Client as WsClient};
+use polymarket_client_sdk::types::U256;
 use rust_decimal::Decimal;
-use serde_json::Value;
+use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::{error, info, warn};
+use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
+use log::{error, info};
+use tracing::debug;
 
-const CLOB_WS_BASE: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
+const STALENESS_SECS: u64 = 15;
+
+fn unix_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
+/// Remove float/string parse artifacts on CLOB WebSocket prices (e.g. 0.8499999999999999 → 0.85).
+fn clean_ws_price(price: Decimal) -> Decimal {
+    rust_decimal::Decimal::from_str(&format!("{:.4}", price)).unwrap_or(price)
+}
 
 #[derive(Debug, Clone)]
 pub enum OrderbookCommand {
@@ -19,17 +34,72 @@ pub enum OrderbookCommand {
     Unsubscribe(String),
 }
 
+/// Event emitted when best_ask crosses the sniper entry threshold (see `Config::sniper_entry_min_best_ask`)
+#[derive(Debug, Clone)]
+pub struct PriceThresholdEvent {
+    pub token_id: String,
+    pub best_ask: Decimal,
+    pub timestamp: std::time::Instant,
+}
+
 pub struct OrderbookManager {
     orderbooks: Arc<DashMap<String, OrderbookState>>,
     command_tx: broadcast::Sender<OrderbookCommand>,
+    /// Fires after every CLOB book update (token_id) — for WebSocket-driven strategies (e.g. spread capture).
+    book_update_tx: broadcast::Sender<String>,
+    /// Broadcast channel for price threshold events (best_ask >= sniper entry minimum)
+    price_event_tx: broadcast::Sender<PriceThresholdEvent>,
+    /// Minimum best_ask to emit threshold events (matches sniper entry gate)
+    sniper_entry_min_best_ask: Decimal,
+    /// Last time any WebSocket message was received (Unix timestamp). Used for staleness check.
+    last_message_timestamp: Arc<AtomicU64>,
+    /// Per-token cancel tokens for SDK orderbook stream tasks
+    active_stream_cancels: Arc<DashMap<String, CancellationToken>>,
 }
 
 impl OrderbookManager {
-    pub fn new() -> Self {
+    pub fn new(sniper_entry_min_best_ask: Decimal) -> Self {
         let (command_tx, _) = broadcast::channel(1000);
+        let (book_update_tx, _) = broadcast::channel(16384);
+        let (price_event_tx, _) = broadcast::channel(10000); // Large buffer for high-frequency events
         Self {
             orderbooks: Arc::new(DashMap::new()),
             command_tx,
+            book_update_tx,
+            price_event_tx,
+            sniper_entry_min_best_ask,
+            last_message_timestamp: Arc::new(AtomicU64::new(0)),
+            active_stream_cancels: Arc::new(DashMap::new()),
+        }
+    }
+
+    /// Subscribe to notifications after each orderbook snapshot update for a token (WebSocket-driven).
+    pub fn subscribe_book_updates(&self) -> broadcast::Receiver<String> {
+        self.book_update_tx.subscribe()
+    }
+
+    /// Subscribe to price threshold events when best_ask reaches the sniper entry minimum.
+    /// Returns a receiver that will get events immediately when prices cross the threshold
+    pub fn subscribe_price_events(&self) -> broadcast::Receiver<PriceThresholdEvent> {
+        self.price_event_tx.subscribe()
+    }
+
+    /// Emit a price event when best_ask is at or above the sniper entry threshold.
+    /// Called immediately after orderbook updates for sub-2ms detection latency
+    fn check_and_emit_price_threshold(&self, token_id: &str) {
+        let threshold = self.sniper_entry_min_best_ask;
+        if let Some(orderbook) = self.orderbooks.get(token_id) {
+            if let Some(best_ask) = orderbook.best_ask() {
+                if best_ask >= threshold {
+                    let event = PriceThresholdEvent {
+                        token_id: token_id.to_string(),
+                        best_ask,
+                        timestamp: std::time::Instant::now(),
+                    };
+                    // Non-blocking send - if receiver is slow, drop the event (we'll get another one soon)
+                    let _ = self.price_event_tx.send(event);
+                }
+            }
         }
     }
 
@@ -37,7 +107,7 @@ impl OrderbookManager {
         self.orderbooks.get(token_id).map(|r| r.clone())
     }
 
-    pub fn subscribe(&self, token_id: String) -> Result<()> {
+    pub fn subscribe(&self, token_id: String) -> anyhow::Result<()> {
         self.command_tx
             .send(OrderbookCommand::Subscribe(token_id))
             .map_err(|e| anyhow::anyhow!("Failed to send subscribe command: {}", e))?;
@@ -68,409 +138,189 @@ impl OrderbookManager {
             token_id: token_id.clone(),
             bids,
             asks,
-            timestamp: Utc::now(),
+            timestamp: chrono::Utc::now(),
         };
 
         self.orderbooks.insert(token_id, state);
     }
 
-    pub async fn run(
-        &self,
-        mut shutdown: tokio_util::sync::CancellationToken,
-    ) -> Result<()> {
-        let mut command_rx = self.command_tx.subscribe();
-        let mut subscribed_tokens = std::collections::HashSet::new();
-        let mut reconnect_delay = std::time::Duration::from_secs(1);
-        let max_delay = std::time::Duration::from_secs(30);
-
-        loop {
-            if shutdown.is_cancelled() {
-                info!("Orderbook manager shutting down");
-                break;
-            }
-
-            match self
-                .connect_and_run(&mut command_rx, &mut subscribed_tokens, &mut shutdown)
-                .await
-            {
-                Ok(_) => break,
-                Err(e) => {
-                    error!(error = %e, error_debug = ?e, "Orderbook connection error, reconnecting");
-                    tokio::time::sleep(reconnect_delay).await;
-                    reconnect_delay = (reconnect_delay * 2).min(max_delay);
-                }
-            }
-        }
-
-        Ok(())
+    fn parse_asset_id(token_id: &str) -> Result<U256> {
+        U256::from_str(token_id).map_err(|e| anyhow::anyhow!("invalid asset id {token_id}: {e}"))
     }
 
-    async fn connect_and_run(
-        &self,
-        command_rx: &mut broadcast::Receiver<OrderbookCommand>,
-        subscribed_tokens: &mut std::collections::HashSet<String>,
-        shutdown: &mut tokio_util::sync::CancellationToken,
-    ) -> Result<()> {
-        let (ws_stream, _) = connect_async(CLOB_WS_BASE)
-            .await
-            .with_context(|| format!("Failed to connect to CLOB WebSocket at {}", CLOB_WS_BASE))?;
+    fn book_update_to_state(book: &BookUpdate) -> OrderbookState {
+        let token_id = book.asset_id.to_string();
+        let bids: Vec<crate::types::OrderbookLevel> = book
+            .bids
+            .iter()
+            .map(|l| crate::types::OrderbookLevel {
+                price: clean_ws_price(l.price),
+                size: l.size,
+            })
+            .collect();
+        let asks: Vec<crate::types::OrderbookLevel> = book
+            .asks
+            .iter()
+            .map(|l| crate::types::OrderbookLevel {
+                price: clean_ws_price(l.price),
+                size: l.size,
+            })
+            .collect();
+        let timestamp =
+            DateTime::from_timestamp_millis(book.timestamp).unwrap_or_else(Utc::now);
 
-        info!("Connected to CLOB WebSocket");
-
-        let (mut write, mut read) = ws_stream.split();
-
-        // Re-subscribe to all tokens on reconnect
-        if !subscribed_tokens.is_empty() {
-            let assets_ids: Vec<String> = subscribed_tokens.iter().cloned().collect();
-            let sub_msg = serde_json::json!({
-                "assets_ids": assets_ids,
-                "type": "market",
-                "custom_feature_enabled": true
-            });
-            write
-                .send(Message::Text(sub_msg.to_string()))
-                .await
-                .with_context(|| format!("Failed to send subscription message: {}", sub_msg))?;
-            info!(tokens = ?assets_ids, "Re-subscribed to orderbooks");
+        OrderbookState {
+            token_id,
+            bids,
+            asks,
+            timestamp,
         }
+    }
 
-        // Start heartbeat task - send PING every 10 seconds
-        let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(10));
-        ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    fn apply_book_update(&self, book: &BookUpdate) {
+        self.last_message_timestamp.store(unix_secs(), Ordering::Relaxed);
+
+        let asset_id = book.asset_id.to_string();
+        let state = Self::book_update_to_state(book);
+        let best_bid = state.best_bid();
+        let best_ask = state.best_ask();
+        self.orderbooks.insert(asset_id.clone(), state);
+
+        debug!(
+            asset_id = %asset_id,
+            best_bid = ?best_bid,
+            best_ask = ?best_ask,
+            "Orderbook snapshot received (SDK book stream)"
+        );
+
+        self.check_and_emit_price_threshold(&asset_id);
+        let _ = self.book_update_tx.send(asset_id);
+    }
+
+    pub async fn run(self: Arc<Self>, shutdown: CancellationToken) -> Result<()> {
+        let mut command_rx = self.command_tx.subscribe();
+
+        self.last_message_timestamp.store(unix_secs(), Ordering::Relaxed);
+
+        let client = WsClient::default();
+        tracing::info!("Using Polymarket SDK CLOB WebSocket client for orderbook streams");
+
+        let stale_self = Arc::clone(&self);
+        let stale_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let mut staleness_interval = tokio::time::interval(Duration::from_secs(2));
+            staleness_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = stale_shutdown.cancelled() => break,
+                    _ = staleness_interval.tick() => {
+                        let now = unix_secs();
+                        let last = stale_self.last_message_timestamp.load(Ordering::Relaxed);
+                        if now.saturating_sub(last) > STALENESS_SECS {
+                            tracing::warn!(
+                                "CLOB orderbook stream stale — no book updates for {}s (SDK may reconnect)",
+                                STALENESS_SECS
+                            );
+                        }
+                    }
+                }
+            }
+        });
 
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
-                    break;
-                }
-                _ = ping_interval.tick() => {
-                    // Send PING to keep connection alive
-                    if let Err(e) = write.send(Message::Ping(vec![])).await {
-                        error!(error = %e, error_debug = ?e, "Failed to send PING");
-                        return Err(anyhow::anyhow!("Failed to send PING: {:?}", e));
+                    tracing::info!("Orderbook manager shutting down");
+                    for entry in self.active_stream_cancels.iter() {
+                        entry.value().cancel();
                     }
+                    self.active_stream_cancels.clear();
+                    break Ok(());
                 }
                 cmd = command_rx.recv() => {
                     match cmd {
                         Ok(OrderbookCommand::Subscribe(token_id)) => {
-                            if subscribed_tokens.insert(token_id.clone()) {
-                                let sub_msg = serde_json::json!({
-                                    "assets_ids": [token_id.clone()],
-                                    "operation": "subscribe",
-                                    "custom_feature_enabled": true
-                                });
-                                if let Err(e) = write.send(Message::Text(sub_msg.to_string())).await {
-                                    error!(error = %e, error_debug = ?e, token_id = %token_id, "Failed to send subscription");
-                                } else {
-                                    info!(token_id = %token_id, "Subscribed to orderbook");
-                                }
+                            if self.active_stream_cancels.contains_key(&token_id) {
+                                debug!(token_id = %token_id, "Already subscribed to orderbook (SDK stream)");
+                                continue;
                             }
+
+                            let asset_u256 = match Self::parse_asset_id(&token_id) {
+                                Ok(id) => id,
+                                Err(e) => {
+                                    tracing::error!(token_id = %token_id, error = %e, "Bad token id for CLOB subscription");
+                                    continue;
+                                }
+                            };
+
+                            let stream = match client.subscribe_orderbook(vec![asset_u256]) {
+                                Ok(s) => {
+                                    info!("WS STREAM CONNECTED for asset: {}", token_id);
+                                    s
+                                }
+                                Err(e) => {
+                                    error!("WS SUBSCRIBE FAILED for {}: {:?}", token_id, e);
+                                    continue;
+                                }
+                            };
+
+                            let cancel = CancellationToken::new();
+                            self.active_stream_cancels.insert(token_id.clone(), cancel.clone());
+
+                            let om = Arc::clone(&self);
+                            let client_task = client.clone();
+                            let token_for_map = token_id.clone();
+                            let cancels = Arc::clone(&self.active_stream_cancels);
+
+                            tokio::spawn(async move {
+                                let asset_id = token_for_map.clone();
+                                info!("WS TASK STARTED for asset: {}", asset_id);
+                                let mut stream = Box::pin(stream);
+                                loop {
+                                    tokio::select! {
+                                        _ = cancel.cancelled() => {
+                                            if let Err(e) = client_task.unsubscribe_orderbook(&[asset_u256]) {
+                                                tracing::error!(error = %e, "SDK unsubscribe_orderbook failed");
+                                            }
+                                            cancels.remove(&token_for_map);
+                                            break;
+                                        }
+                                        next = stream.next() => {
+                                            match next {
+                                                None => {
+                                                    info!("WS STREAM ENDED for {} — loop exited naturally", asset_id);
+                                                    if let Err(e) = client_task.unsubscribe_orderbook(&[asset_u256]) {
+                                                        tracing::error!(error = %e, "SDK unsubscribe_orderbook failed");
+                                                    }
+                                                    cancels.remove(&token_for_map);
+                                                    break;
+                                                }
+                                                Some(msg) => {
+                                                    debug!("WS MSG RECEIVED for {}: {:?}", asset_id, msg);
+                                                    match msg {
+                                                        Ok(book) => {
+                                                            om.apply_book_update(&book);
+                                                        }
+                                                        Err(e) => {
+                                                            tracing::error!("SDK WS stream error for token {}: {}", token_for_map, e);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            });
                         }
                         Ok(OrderbookCommand::Unsubscribe(token_id)) => {
-                            subscribed_tokens.remove(&token_id);
-                            // Note: CLOB WebSocket doesn't have explicit unsubscribe
+                            if let Some((_k, cancel)) = self.active_stream_cancels.remove(&token_id) {
+                                cancel.cancel();
+                            }
                         }
                         Err(_) => {}
                     }
                 }
-                msg = read.next() => {
-                    match msg {
-                        Some(Ok(Message::Text(text))) => {
-                            // Handle PONG response
-                            if text == "PONG" {
-                                continue;
-                            }
-                            if let Err(e) = self.handle_message(&text).await {
-                                error!(error = %e, error_debug = ?e, message = %text, "Error handling orderbook message");
-                            }
-                        }
-                        Some(Ok(Message::Pong(_))) => {
-                            // Server responded to our PING
-                            continue;
-                        }
-                        Some(Ok(Message::Close(frame))) => {
-                            let reason = frame.map(|f| format!("code: {}, reason: {}", f.code, f.reason)).unwrap_or_else(|| "no reason".to_string());
-                            warn!(reason = %reason, "Orderbook WebSocket closed by server");
-                            return Err(anyhow::anyhow!("WebSocket closed: {}", reason));
-                        }
-                        Some(Err(e)) => {
-                            error!(error = %e, error_debug = ?e, "Orderbook WebSocket error");
-                            return Err(anyhow::anyhow!("WebSocket error: {:?}", e));
-                        }
-                        None => {
-                            warn!("Orderbook WebSocket stream ended");
-                            return Err(anyhow::anyhow!("WebSocket stream ended"));
-                        }
-                        _ => {}
-                    }
-                }
             }
         }
-
-        Ok(())
-    }
-
-    async fn handle_message(&self, text: &str) -> Result<()> {
-        // Parse as JSON value first - handle both single objects and arrays
-        let value: Value = serde_json::from_str(text)
-            .with_context(|| format!("Failed to parse JSON. Message: {}", text))?;
-
-        // Handle array of messages
-        let messages: Vec<Value> = if let Value::Array(arr) = value {
-            arr
-        } else {
-            vec![value]
-        };
-
-        for msg in messages {
-            // Check event_type to determine message type
-            let event_type = msg.get("event_type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-
-            match event_type {
-                "book" => {
-                    self.handle_book_message(&msg)?;
-                }
-                "price_change" => {
-                    self.handle_price_change_message(&msg)?;
-                }
-                "last_trade_price" => {
-                    // Silently skip - user said to log or silently skip
-                    // For now, silently skip
-                }
-                "best_bid_ask" => {
-                    self.handle_best_bid_ask_message(&msg)?;
-                }
-                _ => {
-                    // Unknown event_type - silently skip
-                    continue;
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn handle_book_message(&self, msg: &Value) -> Result<()> {
-        let asset_id = msg
-            .get("asset_id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing asset_id in book message"))?
-            .to_string();
-
-        // Parse bids - they are objects with "price" and "size" fields, not tuples
-        let bids = msg
-            .get("bids")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| anyhow::anyhow!("Missing or invalid bids in book message"))?;
-
-        let parsed_bids: Vec<crate::types::OrderbookLevel> = bids
-            .iter()
-            .filter_map(|b| {
-                let price_str = b.get("price")?.as_str()?;
-                let size_str = b.get("size")?.as_str()?;
-                let price = price_str.parse::<Decimal>().ok()?;
-                let size = size_str.parse::<Decimal>().ok()?;
-                Some(crate::types::OrderbookLevel { price, size })
-            })
-            .collect();
-
-        // Parse asks - they are objects with "price" and "size" fields, not tuples
-        let asks = msg
-            .get("asks")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| anyhow::anyhow!("Missing or invalid asks in book message"))?;
-
-        let parsed_asks: Vec<crate::types::OrderbookLevel> = asks
-            .iter()
-            .filter_map(|a| {
-                let price_str = a.get("price")?.as_str()?;
-                let size_str = a.get("size")?.as_str()?;
-                let price = price_str.parse::<Decimal>().ok()?;
-                let size = size_str.parse::<Decimal>().ok()?;
-                Some(crate::types::OrderbookLevel { price, size })
-            })
-            .collect();
-
-        // Extract best_bid from top of bids (first element)
-        // Extract best_ask from bottom of asks (last element) - but actually asks are usually sorted ascending
-        // so best_ask is the first (lowest) ask. Let's check the user's instruction again.
-        // User said: "Extract best_bid from top of bids, best_ask from bottom of asks."
-        // This suggests bids are sorted descending (best bid first) and asks are sorted descending too (best ask last).
-        // But typically asks are sorted ascending. Let me follow the user's instruction literally.
-
-        let state = OrderbookState {
-            token_id: asset_id.clone(),
-            bids: parsed_bids,
-            asks: parsed_asks,
-            timestamp: Utc::now(),
-        };
-
-        self.orderbooks.insert(asset_id, state);
-
-        Ok(())
-    }
-
-    fn handle_price_change_message(&self, msg: &Value) -> Result<()> {
-        let price_changes = msg
-            .get("price_changes")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| anyhow::anyhow!("Missing or invalid price_changes in price_change message"))?;
-
-        for change in price_changes {
-            let asset_id = match change.get("asset_id").and_then(|v| v.as_str()) {
-                Some(id) => id.to_string(),
-                None => continue,
-            };
-
-            let best_bid_str = change.get("best_bid").and_then(|v| v.as_str());
-            let best_ask_str = change.get("best_ask").and_then(|v| v.as_str());
-
-            // Update the orderbook for this asset
-            if let Some(mut entry) = self.orderbooks.get_mut(&asset_id) {
-                // Update best bid if provided
-                if let Some(bid_str) = best_bid_str {
-                    if let Ok(bid_price) = bid_str.parse::<Decimal>() {
-                        if let Some(first_bid) = entry.bids.first_mut() {
-                            first_bid.price = bid_price;
-                        } else {
-                            // No bids exist, create one
-                            entry.bids.insert(0, crate::types::OrderbookLevel {
-                                price: bid_price,
-                                size: Decimal::ZERO,
-                            });
-                        }
-                    }
-                }
-
-                // Update best ask if provided
-                if let Some(ask_str) = best_ask_str {
-                    if let Ok(ask_price) = ask_str.parse::<Decimal>() {
-                        if let Some(first_ask) = entry.asks.first_mut() {
-                            first_ask.price = ask_price;
-                        } else {
-                            // No asks exist, create one
-                            entry.asks.insert(0, crate::types::OrderbookLevel {
-                                price: ask_price,
-                                size: Decimal::ZERO,
-                            });
-                        }
-                    }
-                }
-
-                entry.timestamp = Utc::now();
-            } else {
-                // Orderbook doesn't exist yet, create a minimal one
-                let mut bids = Vec::new();
-                let mut asks = Vec::new();
-
-                if let Some(bid_str) = best_bid_str {
-                    if let Ok(bid_price) = bid_str.parse::<Decimal>() {
-                        bids.push(crate::types::OrderbookLevel {
-                            price: bid_price,
-                            size: Decimal::ZERO,
-                        });
-                    }
-                }
-
-                if let Some(ask_str) = best_ask_str {
-                    if let Ok(ask_price) = ask_str.parse::<Decimal>() {
-                        asks.push(crate::types::OrderbookLevel {
-                            price: ask_price,
-                            size: Decimal::ZERO,
-                        });
-                    }
-                }
-
-                let state = OrderbookState {
-                    token_id: asset_id.clone(),
-                    bids,
-                    asks,
-                    timestamp: Utc::now(),
-                };
-
-                self.orderbooks.insert(asset_id, state);
-            }
-        }
-
-        Ok(())
-    }
-
-    fn handle_best_bid_ask_message(&self, msg: &Value) -> Result<()> {
-        let asset_id = msg
-            .get("asset_id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing asset_id in best_bid_ask message"))?
-            .to_string();
-
-        let best_bid_str = msg.get("best_bid").and_then(|v| v.as_str());
-        let best_ask_str = msg.get("best_ask").and_then(|v| v.as_str());
-
-        // Update the orderbook for this asset
-        if let Some(mut entry) = self.orderbooks.get_mut(&asset_id) {
-            // Update best bid if provided
-            if let Some(bid_str) = best_bid_str {
-                if let Ok(bid_price) = bid_str.parse::<Decimal>() {
-                    if let Some(first_bid) = entry.bids.first_mut() {
-                        first_bid.price = bid_price;
-                    } else {
-                        entry.bids.insert(0, crate::types::OrderbookLevel {
-                            price: bid_price,
-                            size: Decimal::ZERO,
-                        });
-                    }
-                }
-            }
-
-            // Update best ask if provided
-            if let Some(ask_str) = best_ask_str {
-                if let Ok(ask_price) = ask_str.parse::<Decimal>() {
-                    if let Some(first_ask) = entry.asks.first_mut() {
-                        first_ask.price = ask_price;
-                    } else {
-                        entry.asks.insert(0, crate::types::OrderbookLevel {
-                            price: ask_price,
-                            size: Decimal::ZERO,
-                        });
-                    }
-                }
-            }
-
-            entry.timestamp = Utc::now();
-        } else {
-            // Orderbook doesn't exist yet, create a minimal one
-            let mut bids = Vec::new();
-            let mut asks = Vec::new();
-
-            if let Some(bid_str) = best_bid_str {
-                if let Ok(bid_price) = bid_str.parse::<Decimal>() {
-                    bids.push(crate::types::OrderbookLevel {
-                        price: bid_price,
-                        size: Decimal::ZERO,
-                    });
-                }
-            }
-
-            if let Some(ask_str) = best_ask_str {
-                if let Ok(ask_price) = ask_str.parse::<Decimal>() {
-                    asks.push(crate::types::OrderbookLevel {
-                        price: ask_price,
-                        size: Decimal::ZERO,
-                    });
-                }
-            }
-
-            let state = OrderbookState {
-                token_id: asset_id.clone(),
-                bids,
-                asks,
-                timestamp: Utc::now(),
-            };
-
-            self.orderbooks.insert(asset_id, state);
-        }
-
-        Ok(())
     }
 }

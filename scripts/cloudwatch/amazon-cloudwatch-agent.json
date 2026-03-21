@@ -1,0 +1,33 @@
+{
+  "agent": {
+    "metrics_collection_interval": 60
+  },
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/home/ubuntu/polymarket-bot/logs/polymarket-bot*.log",
+            "log_group_name": "/ec2/polymarket-bot/app",
+            "log_stream_name": "{instance_id}"
+          }
+        ]
+      }
+    }
+  },
+  "metrics": {
+    "append_dimensions": {
+      "InstanceId": "${aws:InstanceId}"
+    },
+    "metrics_collected": {
+      "disk": {
+        "measurement": [
+          {
+            "name": "used_percent"
+          }
+        ],
+        "resources": ["*"]
+      }
+    }
+  }
+}

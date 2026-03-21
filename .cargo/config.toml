@@ -1,0 +1,3 @@
+[alias]
+# Fast optimized build (see [profile.release-fast] in Cargo.toml)
+brf = "build --profile release-fast --bin polymarket-bot"

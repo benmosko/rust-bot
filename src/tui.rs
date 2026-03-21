@@ -1,7 +1,9 @@
 //! Professional trading dashboard TUI using ratatui + crossterm.
-//! Renders portfolio, session stats, active rounds, spread capture, P&L sparkline, and trade log.
+//! Renders portfolio, session stats, active rounds, round history, P&L sparkline, and trade log.
 
-use crate::types::{Coin, Period, TuiData, TuiEvent, TuiRoundRow, TuiSpreadRow};
+use crate::types::{
+    Coin, Period, RoundHistoryEntry, RoundHistoryStatus, TuiData, TuiEvent, TuiRoundRow, TuiSpreadRow,
+};
 use chrono::Local;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
@@ -9,99 +11,97 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScree
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, List, ListItem, Paragraph, Row, Sparkline, Table};
+use ratatui::widgets::{Block, Borders, Cell, List, ListItem, Paragraph, Row, Table};
 use ratatui::{Frame, Terminal};
 use rust_decimal::Decimal;
-use std::io::{self, Write};
-use std::sync::{Arc, Mutex};
+use std::io;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::time::{self, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
-const PNL_HISTORY_LEN: usize = 60;
 const TRADE_LOG_LEN: usize = 20;
-const TICK_MS: u64 = 500;
 
-/// Writer that forwards each log line to the TUI trade log via TuiEvent::TradeLog.
-/// Used as a tracing_subscriber writer so that log output appears in the dashboard.
-#[allow(dead_code)]
-pub struct TuiWriter {
-    inner: Mutex<TuiWriterInner>,
-}
+/// Gaps between Round History columns (ratatui adds `(cols - 1) * spacing` on top of column widths).
+const ROUND_HISTORY_COLUMN_SPACING: u16 = 1;
 
-struct TuiWriterInner {
-    buf: Vec<u8>,
-    tx: mpsc::Sender<TuiEvent>,
-}
+/// Round History: fixed columns + flexible Shares. `usable_width` is inner table width **minus**
+/// inter-column gaps so `Length` sums match what `Layout::split` assigns to cells (avoids clipping).
+/// `FIXED_MAX` is column total when P&L uses 10 cols and shares 0.
+fn round_history_column_constraints(usable_width: u16) -> [Constraint; 9] {
+    const W_TIME: u16 = 8;
+    const W_COIN: u16 = 6;
+    const W_SIDE: u16 = 4;
+    const W_PRICE: u16 = 6;
+    const W_PNL_MAX: u16 = 10;
+    const W_PNL_MIN: u16 = 9;
+    const W_ST: u16 = 6;
+    // All columns except Shares when P&L uses max width (10).
+    const FIXED_MAX: u16 = W_TIME + W_COIN + W_SIDE + 3 * W_PRICE + W_PNL_MAX + W_ST;
 
-impl TuiWriter {
-    #[allow(dead_code)]
-    pub fn new(tx: mpsc::Sender<TuiEvent>) -> Self {
-        Self {
-            inner: Mutex::new(TuiWriterInner {
-                buf: Vec::new(),
-                tx,
-            }),
-        }
+    let w = usable_width.max(1);
+    if w > FIXED_MAX {
+        let share = w - FIXED_MAX;
+        [
+            Constraint::Length(W_TIME),
+            Constraint::Length(W_COIN),
+            Constraint::Length(W_SIDE),
+            Constraint::Length(W_PRICE),
+            Constraint::Length(W_PRICE),
+            Constraint::Length(W_PRICE),
+            Constraint::Length(share),
+            Constraint::Length(W_PNL_MAX),
+            Constraint::Length(W_ST),
+        ]
+    } else if w == FIXED_MAX {
+        // Exactly enough for fixed + 1-char shares; use narrow P&L header width
+        [
+            Constraint::Length(W_TIME),
+            Constraint::Length(W_COIN),
+            Constraint::Length(W_SIDE),
+            Constraint::Length(W_PRICE),
+            Constraint::Length(W_PRICE),
+            Constraint::Length(W_PRICE),
+            Constraint::Length(1),
+            Constraint::Length(W_PNL_MIN),
+            Constraint::Length(W_ST),
+        ]
+    } else {
+        // Very narrow terminal: proportional; may still clip if w is tiny
+        [
+            Constraint::Ratio(8, 60),
+            Constraint::Ratio(6, 60),
+            Constraint::Ratio(4, 60),
+            Constraint::Ratio(6, 60),
+            Constraint::Ratio(6, 60),
+            Constraint::Ratio(6, 60),
+            Constraint::Ratio(8, 60),
+            Constraint::Ratio(10, 60),
+            Constraint::Ratio(6, 60),
+        ]
     }
 }
 
-impl Write for TuiWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let mut inner = self.inner.lock().map_err(|_| std::io::ErrorKind::Other)?;
-        inner.buf.extend_from_slice(buf);
-        while let Some(i) = inner.buf.iter().position(|&b| b == b'\n') {
-            let line = String::from_utf8_lossy(&inner.buf[..i]).trim().to_string();
-            inner.buf.drain(..=i);
-            if !line.is_empty() {
-                let _ = inner.tx.try_send(TuiEvent::TradeLog(line));
-            }
-        }
-        Ok(buf.len())
+/// Shorten long strategy lines so narrow terminals still show useful text.
+fn abbrev_active_round_strategy(s: &str) -> String {
+    let t = s.trim();
+    let t = t.replace("Cap reached", "Capped");
+    let t = t.replace("Dual filled, rest cx'd", "Dual+cx");
+    if t.chars().count() > 32 {
+        t.chars().take(29).collect::<String>() + "…"
+    } else {
+        t
     }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-/// Writer returned by the closure for tracing_subscriber; implements Write.
-pub(crate) struct TuiWriterRef(Arc<Mutex<TuiWriterInner>>);
-
-impl Write for TuiWriterRef {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let mut inner = self.0.lock().map_err(|_| std::io::ErrorKind::Other)?;
-        inner.buf.extend_from_slice(buf);
-        while let Some(i) = inner.buf.iter().position(|&b| b == b'\n') {
-            let line = String::from_utf8_lossy(&inner.buf[..i]).trim().to_string();
-            inner.buf.drain(..=i);
-            if !line.is_empty() {
-                let _ = inner.tx.try_send(TuiEvent::TradeLog(line));
-            }
-        }
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-/// Returns a closure that implements `MakeWriter` for the tracing layer:
-/// each call returns a writer that forwards log lines to the TUI trade log.
-pub fn tui_writer_layer(tx: mpsc::Sender<TuiEvent>) -> impl Fn() -> TuiWriterRef + Send + 'static {
-    let arc = Arc::new(Mutex::new(TuiWriterInner {
-        buf: Vec::new(),
-        tx,
-    }));
-    move || TuiWriterRef(arc.clone())
 }
 
 /// Focused panel for keyboard (Tab cycle).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Main,
+    RoundHistory,
     TradeLog,
 }
 
@@ -112,6 +112,9 @@ pub async fn run_tui(
     mut rx: mpsc::Receiver<TuiEvent>,
     shutdown: CancellationToken,
     dry_run: Arc<AtomicBool>,
+    market_slots: Vec<(Coin, Period)>,
+    round_history: Arc<Mutex<Vec<RoundHistoryEntry>>>,
+    session_start: std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic| {
@@ -128,48 +131,98 @@ pub async fn run_tui(
     let mut terminal = Terminal::new(backend)?;
 
     let mut data = TuiData::default();
+    data.market_slots = market_slots;
+    data.session_start = session_start;
     let mut focus = Focus::Main;
     let mut log_scroll: usize = 0;
+    let mut round_history_scroll: usize = 0;
 
-    loop {
-        if shutdown.is_cancelled() {
-            break;
+    // Frequent redraw so session P&L (sum of round_history `pnl`) updates soon after resolution.
+    let mut render_tick = time::interval(Duration::from_millis(250));
+    render_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    'tui: loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => break 'tui,
+            ev = rx.recv() => {
+                match ev {
+                    Some(e) => apply_event(&mut data, e),
+                    None => break 'tui,
+                }
+            }
+            _ = render_tick.tick() => {}
         }
 
-        // Drain all pending TuiEvents (non-blocking)
+        if shutdown.is_cancelled() {
+            break 'tui;
+        }
+
         while let Ok(ev) = rx.try_recv() {
             apply_event(&mut data, ev);
         }
 
         let is_dry_run = dry_run.load(Ordering::Relaxed);
-        terminal.draw(|f| ui(f, &data, focus, log_scroll, is_dry_run))?;
+        let round_history_snapshot: Vec<RoundHistoryEntry> = round_history
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        terminal.draw(|f| {
+            ui(
+                f,
+                &data,
+                focus,
+                log_scroll,
+                round_history_scroll,
+                &round_history_snapshot,
+                is_dry_run,
+            )
+        })?;
 
-        // Poll for input with 500ms timeout
-        if event::poll(Duration::from_millis(TICK_MS))? {
+        while event::poll(Duration::ZERO)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
                 match key.code {
-                    KeyCode::Char('q') => break,
+                    KeyCode::Char('q') => break 'tui,
                     KeyCode::Char('p') => {
                         data.paused = true;
                         let _ = rx.try_recv(); // ignore stale
                     }
                     KeyCode::Char('r') => data.paused = false,
                     KeyCode::Up => {
-                        if focus == Focus::TradeLog && log_scroll < data.trade_log.len().saturating_sub(1) {
-                            log_scroll = log_scroll.saturating_add(1).min(data.trade_log.len().saturating_sub(1));
+                        match focus {
+                            Focus::TradeLog => {
+                                if log_scroll < data.trade_log.len().saturating_sub(1) {
+                                    log_scroll = log_scroll
+                                        .saturating_add(1)
+                                        .min(data.trade_log.len().saturating_sub(1));
+                                }
+                            }
+                            Focus::RoundHistory => {
+                                round_history_scroll = round_history_scroll.saturating_add(1);
+                            }
+                            Focus::Main => {}
                         }
                     }
                     KeyCode::Down => {
-                        if focus == Focus::TradeLog && log_scroll > 0 {
-                            log_scroll = log_scroll.saturating_sub(1);
+                        match focus {
+                            Focus::TradeLog => {
+                                if log_scroll > 0 {
+                                    log_scroll = log_scroll.saturating_sub(1);
+                                }
+                            }
+                            Focus::RoundHistory => {
+                                round_history_scroll = round_history_scroll.saturating_sub(1);
+                            }
+                            Focus::Main => {}
                         }
                     }
                     KeyCode::Tab => {
                         focus = match focus {
-                            Focus::Main => Focus::TradeLog,
+                            Focus::Main => Focus::RoundHistory,
+                            Focus::RoundHistory => Focus::TradeLog,
                             Focus::TradeLog => Focus::Main,
                         };
                     }
@@ -188,30 +241,22 @@ pub async fn run_tui(
 fn apply_event(data: &mut TuiData, ev: TuiEvent) {
     match ev {
         TuiEvent::BalanceUpdate(b) => data.balance = b,
-        TuiEvent::PnlUpdate(pnl) => {
-            data.pnl = pnl;
-            let v = pnl.to_string().parse::<f64>().unwrap_or(0.0);
-            data.pnl_history.push(v);
-            if data.pnl_history.len() > PNL_HISTORY_LEN {
-                data.pnl_history.remove(0);
-            }
+        TuiEvent::PnlUpdate(_) => {
+            // Session P&L in the header is never stored here: `ui()` recomputes
+            // `RoundHistoryEntry::sum_session_pnl` from the live `round_history` snapshot each draw.
         }
         TuiEvent::SessionStats {
-            trades,
             rounds,
-            win_rate_pct,
-            pnl_pct,
-            uptime_secs,
+            uptime_secs: _,
             avg_pair_cost,
             rebates,
+            session_start_balance,
         } => {
-            data.trades = trades;
             data.rounds = rounds;
-            data.win_rate_pct = win_rate_pct;
-            data.pnl_pct = pnl_pct;
-            data.uptime_secs = uptime_secs;
+            // uptime is computed on every render from data.session_start, not from events
             data.avg_pair_cost = avg_pair_cost;
             data.rebates = rebates;
+            data.session_start_balance = session_start_balance;
         }
         TuiEvent::InvestedUpdate(inv) => data.invested = inv,
         TuiEvent::OpenPosUpdate(n) => data.open_pos = n,
@@ -276,7 +321,15 @@ fn apply_event(data: &mut TuiData, ev: TuiEvent) {
     }
 }
 
-fn ui(f: &mut Frame, data: &TuiData, focus: Focus, log_scroll: usize, is_dry_run: bool) {
+fn ui(
+    f: &mut Frame,
+    data: &TuiData,
+    focus: Focus,
+    log_scroll: usize,
+    round_history_scroll: usize,
+    round_history: &[RoundHistoryEntry],
+    is_dry_run: bool,
+) {
     let area = f.area();
 
     let chunks = Layout::new(
@@ -285,8 +338,7 @@ fn ui(f: &mut Frame, data: &TuiData, focus: Focus, log_scroll: usize, is_dry_run
             Constraint::Length(3),
             Constraint::Length(5),
             Constraint::Min(10), // 8 data rows + 1 header row = 9 lines minimum (Min ensures it can grow)
-            Constraint::Length(6),
-            Constraint::Min(6),
+            Constraint::Min(12), // Round History + Trade Log (stacked full-width; needs room for both)
             Constraint::Length(1),
         ],
     )
@@ -319,15 +371,34 @@ fn ui(f: &mut Frame, data: &TuiData, focus: Focus, log_scroll: usize, is_dry_run
     let portfolio_text = vec![
         Line::from(vec![Span::raw("Balance:   "), Span::styled(balance_str, Style::default().fg(Color::White))]),
         Line::from(vec![Span::raw("Invested:  "), Span::styled(invested_str, Style::default().fg(Color::White))]),
-        Line::from(vec![Span::raw("Open Pos:  "), Span::raw(data.open_pos.to_string())]),
+        Line::from(vec![
+            Span::raw("Open Pos:  "),
+            Span::raw(data.open_pos.to_string()),
+            Span::raw("  (all strategies)"),
+        ]),
     ];
     let portfolio = Paragraph::new(portfolio_text).block(portfolio_block);
     f.render_widget(portfolio, row1[0]);
 
-    let pnl_color = if data.pnl >= Decimal::ZERO { Color::Green } else { Color::Red };
-    let pnl_str = format!("${:+.2}", data.pnl);
-    let pnl_pct_str = format!("{:+.1}%", data.pnl_pct);
-    let uptime_str = format_uptime(data.uptime_secs);
+    // Always sum from the current slice (never from TuiEvent::PnlUpdate).
+    let session_pnl = RoundHistoryEntry::sum_session_pnl(round_history);
+    let win_rate_pct = RoundHistoryEntry::session_win_rate_pct(round_history);
+    let trades_resolved = RoundHistoryEntry::resolved_trades_count(round_history);
+    let pnl_pct = if data.session_start_balance > Decimal::ZERO {
+        (session_pnl / data.session_start_balance)
+            .to_string()
+            .parse::<f64>()
+            .unwrap_or(0.0)
+            * 100.0
+    } else {
+        0.0
+    };
+
+    let pnl_color = if session_pnl >= Decimal::ZERO { Color::Green } else { Color::Red };
+    let pnl_str = format!("${:+.2}", session_pnl);
+    let pnl_pct_str = format!("{:+.1}%", pnl_pct);
+    let uptime_secs = data.session_start.elapsed().as_secs();
+    let uptime_str = format_uptime(uptime_secs);
     let avg_cost_str = data
         .avg_pair_cost
         .as_ref()
@@ -338,11 +409,11 @@ fn ui(f: &mut Frame, data: &TuiData, focus: Focus, log_scroll: usize, is_dry_run
             Span::raw("P&L: "),
             Span::styled(format!("{} ({})  ", pnl_str, pnl_pct_str), Style::default().fg(pnl_color)),
             Span::raw("Win: "),
-            Span::styled(format!("{:.1}%", data.win_rate_pct), Style::default().fg(Color::White)),
+            Span::styled(format!("{:.1}%", win_rate_pct), Style::default().fg(Color::White)),
         ]),
         Line::from(vec![
             Span::raw("Trades: "),
-            Span::raw(data.trades.to_string()),
+            Span::raw(trades_resolved.to_string()),
             Span::raw("  Rounds: "),
             Span::raw(data.rounds.to_string()),
             Span::raw("  Uptime: "),
@@ -368,21 +439,25 @@ fn ui(f: &mut Frame, data: &TuiData, focus: Focus, log_scroll: usize, is_dry_run
         .map(|h| Cell::from(*h).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
     let header = Row::new(header_cells).height(1);
 
-    // Define all 8 market slots
-    let all_slots = vec![
-        (Coin::Btc, Period::Five),
-        (Coin::Btc, Period::Fifteen),
-        (Coin::Eth, Period::Five),
-        (Coin::Eth, Period::Fifteen),
-        (Coin::Sol, Period::Five),
-        (Coin::Sol, Period::Fifteen),
-        (Coin::Xrp, Period::Five),
-        (Coin::Xrp, Period::Fifteen),
-    ];
+    let slots = if data.market_slots.is_empty() {
+        // Fallback if caller forgot to pass slots (e.g. tests)
+        vec![
+            (Coin::Btc, Period::Five),
+            (Coin::Btc, Period::Fifteen),
+            (Coin::Eth, Period::Five),
+            (Coin::Eth, Period::Fifteen),
+            (Coin::Sol, Period::Five),
+            (Coin::Sol, Period::Fifteen),
+            (Coin::Xrp, Period::Five),
+            (Coin::Xrp, Period::Fifteen),
+        ]
+    } else {
+        data.market_slots.clone()
+    };
 
     // Get current round_start for each slot (round down to period boundary)
     let now = chrono::Utc::now().timestamp();
-    let rows: Vec<Row> = all_slots
+    let rows: Vec<Row> = slots
         .iter()
         .map(|(coin, period)| {
             let period_secs = period.as_seconds();
@@ -400,17 +475,28 @@ fn ui(f: &mut Frame, data: &TuiData, focus: Focus, log_scroll: usize, is_dry_run
                 let elapsed = (now - round_start) as f64 / period_secs as f64;
                 (elapsed.max(0.0).min(1.0), rust_decimal::Decimal::ZERO, rust_decimal::Decimal::ZERO, "—".to_string(), "Waiting".to_string())
             };
-            
+            let strategy = abbrev_active_round_strategy(&strategy);
+
             let market = format!("{} {}m", coin.as_str().to_uppercase(), period.as_minutes());
             let pct = (elapsed_pct * 10.0).round() as usize;
             let bar: String = (0..10).map(|i| if i < pct { '█' } else { '░' }).collect();
-            let yes_s = if yes_price.is_zero() && status == "Waiting" {
-                "$0.00".to_string()
+            // Show "N/A" if price is zero but market is Active (orderbook not populated yet)
+            // Only show "$0.00" if market is Waiting (not discovered yet)
+            let yes_s = if yes_price.is_zero() {
+                if status == "Waiting" {
+                    "$0.00".to_string()
+                } else {
+                    "N/A".to_string()
+                }
             } else {
                 format!("${:.2}", yes_price)
             };
-            let no_s = if no_price.is_zero() && status == "Waiting" {
-                "$0.00".to_string()
+            let no_s = if no_price.is_zero() {
+                if status == "Waiting" {
+                    "$0.00".to_string()
+                } else {
+                    "N/A".to_string()
+                }
             } else {
                 format!("${:.2}", no_price)
             };
@@ -425,78 +511,153 @@ fn ui(f: &mut Frame, data: &TuiData, focus: Focus, log_scroll: usize, is_dry_run
         })
         .collect();
 
-    let table = Table::new(rows, [Constraint::Length(10), Constraint::Length(12), Constraint::Length(8), Constraint::Length(8), Constraint::Length(15), Constraint::Length(10)])
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Min(9),  // "SOL 15m"
+            Constraint::Min(12), // elapsed bar
+            Constraint::Min(8),
+            Constraint::Min(8),
+            Constraint::Min(24), // strategy / sniper status
+            Constraint::Min(10), // Active / Waiting / Ended
+        ],
+    )
+        .column_spacing(0)
         .header(header)
         .block(Block::default().title(" Active Rounds ").borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
     f.render_widget(table, chunks[2]);
 
-    // Row 3: Spread Capture + P&L Chart
+    // Row 3: Round History (full width) + Trade Log below — avoids squeezing the history table
+    // (50/50 side-by-side made 9 columns + spacing too narrow; time clipped).
     let row3 = Layout::new(
-        Direction::Horizontal,
-        [Constraint::Percentage(50), Constraint::Percentage(50)],
+        Direction::Vertical,
+        [Constraint::Percentage(52), Constraint::Percentage(48)],
     )
     .split(chunks[3]);
 
-    let spread_header = Row::new(vec![
-        Cell::from("Round").style(Style::default().fg(Color::Cyan)),
-        Cell::from("PairCost").style(Style::default().fg(Color::Cyan)),
-        Cell::from("Δ").style(Style::default().fg(Color::Cyan)),
-        Cell::from("Est P").style(Style::default().fg(Color::Cyan)),
-    ]);
-    let spread_rows: Vec<Row> = data
-        .spread_captures
+    let rh_block = Block::default()
+        .title(" Round History (sniper) ")
+        .borders(Borders::ALL)
+        .border_style(if focus == Focus::RoundHistory {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        });
+    let rh_inner = rh_block.inner(row3[0]);
+    let rh_split = Layout::new(
+        Direction::Vertical,
+        [Constraint::Min(2), Constraint::Length(1)],
+    )
+    .split(rh_inner);
+
+    let rh_header = Row::new(
+        [
+            "Time",
+            "Coin",
+            "Side",
+            "Entry",
+            "Hedge",
+            "Pair",
+            "Shares",
+            "P&L",
+            "Status",
+        ]
         .iter()
-        .take(5)
-        .map(|s| {
-            let delta = format!("{:.0}%", s.imbalance_pct * 100.0);
-            let est = format!("+${:.2}", s.est_profit);
+        .map(|h| Cell::from(*h).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+    )
+    .height(1);
+
+    let table_area = rh_split[0];
+    let visible_body = (table_area.height as usize).saturating_sub(1).max(1);
+    let max_rh_scroll = round_history.len().saturating_sub(visible_body);
+    // Vec is chronological (oldest → newest). Default window is the newest segment; scroll up (↑)
+    // moves toward older entries. Rows render newest-first (top = latest fill).
+    let rh_skip = max_rh_scroll.saturating_sub(round_history_scroll.min(max_rh_scroll));
+
+    let rh_rows: Vec<Row> = round_history
+        .iter()
+        .skip(rh_skip)
+        .take(visible_body)
+        .rev()
+        .map(|e| {
+            let t = e
+                .fill_time
+                .with_timezone(&Local)
+                .format("%H:%M:%S")
+                .to_string();
+            let coin_s = format!("{}{}m", e.coin.as_str().to_uppercase(), e.period.as_minutes());
+            let entry_s = format!("${:.2}", e.entry_price);
+            let hedge_s = e
+                .hedge_price
+                .map(|p| format!("${:.2}", p))
+                .unwrap_or_else(|| "—".to_string());
+            let pair_s = e
+                .pair_cost
+                .map(|p| format!("${:.2}", p))
+                .unwrap_or_else(|| "—".to_string());
+            let sh = e.shares.normalize().to_string();
+            let pnl_final = match e.pnl {
+                None => "—".to_string(),
+                Some(p) if p >= Decimal::ZERO => format!("+${:.2}", p),
+                Some(p) => format!("-${:.2}", p.abs()),
+            };
+            let status_s = match e.status {
+                RoundHistoryStatus::Open => "OPEN",
+                RoundHistoryStatus::Hedged => "HEDGED",
+                RoundHistoryStatus::Won => "WON",
+                RoundHistoryStatus::Lost => "LOST",
+            };
             Row::new(vec![
-                Cell::from(s.round_key.clone()),
-                Cell::from(format!("${:.3}", s.pair_cost)),
-                Cell::from(delta),
-                Cell::from(est),
+                Cell::from(t),
+                Cell::from(coin_s),
+                Cell::from(e.side_label.clone()),
+                Cell::from(entry_s),
+                Cell::from(hedge_s),
+                Cell::from(pair_s),
+                Cell::from(sh),
+                Cell::from(pnl_final).style(
+                    if e.pnl.is_none() {
+                        Style::default().fg(Color::DarkGray)
+                    } else if e.pnl.is_some_and(|p| p >= Decimal::ZERO) {
+                        Style::default().fg(Color::Green)
+                    } else {
+                        Style::default().fg(Color::Red)
+                    },
+                ),
+                Cell::from(status_s),
             ])
         })
         .collect();
-    let spread_table = Table::new(spread_rows, [Constraint::Min(12), Constraint::Length(8), Constraint::Length(4), Constraint::Length(8)])
-        .header(spread_header)
-        .block(Block::default().title(" Spread Capture ").borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
-    f.render_widget(spread_table, row3[0]);
 
-    // P&L Chart - show sparkline only if we have data
-    if data.pnl_history.is_empty() {
-        // Show empty chart area with just the block
-        let empty_block = Block::default()
-            .title(" P&L Chart ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray));
-        f.render_widget(empty_block, row3[1]);
-    } else {
-        let min = data.pnl_history.iter().cloned().fold(f64::INFINITY, f64::min);
-        let max = data.pnl_history.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        let range = (max - min).max(1.0);
-        let spark_data: Vec<u64> = data.pnl_history
-            .iter()
-            .map(|v| {
-                // Normalize to 0-8 range for sparkline display
-                let normalized = if range > 0.0 {
-                    (((v - min) / range) * 8.0).round() as u64
-                } else {
-                    4 // Middle if no range
-                };
-                normalized.min(8).max(0)
-            })
-            .collect();
-        
-        let pnl_color = if data.pnl >= Decimal::ZERO { Color::Green } else { Color::Red };
-        let sparkline_widget = Sparkline::default()
-            .data(spark_data.as_slice())
-            .block(Block::default().title(" P&L Chart ").borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)))
-            .style(Style::default().fg(pnl_color));
-        f.render_widget(sparkline_widget, row3[1]);
-    }
+    let total_round_pnl: Decimal = round_history.iter().filter_map(|e| e.pnl).sum();
+    let total_line = format!(
+        " Total: {}{:.2}",
+        if total_round_pnl >= Decimal::ZERO {
+            "+$"
+        } else {
+            "-$"
+        },
+        total_round_pnl.abs()
+    );
 
-    // Trade Log (chunks[4])
+    let rh_gaps = (9usize - 1) as u16 * ROUND_HISTORY_COLUMN_SPACING;
+    let rh_usable = table_area.width.saturating_sub(rh_gaps).max(1);
+    let rh_table = Table::new(rh_rows, round_history_column_constraints(rh_usable))
+        .column_spacing(ROUND_HISTORY_COLUMN_SPACING)
+        .header(rh_header);
+    f.render_widget(rh_table, table_area);
+
+    let total_widget = Paragraph::new(total_line).style(
+        if total_round_pnl >= Decimal::ZERO {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default().fg(Color::Red)
+        },
+    );
+    f.render_widget(total_widget, rh_split[1]);
+    f.render_widget(rh_block, row3[0]);
+
+    // Trade Log (full width under Round History)
     let log_items: Vec<ListItem> = data
         .trade_log
         .iter()
@@ -506,16 +667,17 @@ fn ui(f: &mut Frame, data: &TuiData, focus: Focus, log_scroll: usize, is_dry_run
         .collect();
     let log_list = List::new(log_items)
         .block(Block::default().title(" Trade Log (last 20) ").borders(Borders::ALL).border_style(if focus == Focus::TradeLog { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) }));
-    f.render_widget(log_list, chunks[4]);
+    f.render_widget(log_list, row3[1]);
 
     // Footer
-    let footer = Paragraph::new(" q: quit │ p: pause │ r: resume │ ↑↓: scroll log │ tab: cycle focus ")
+    let footer = Paragraph::new(" q: quit │ p: pause │ r: resume │ ↑↓: scroll │ tab: focus │ open pos = all strategies; history = sniper ")
         .style(Style::default().fg(Color::DarkGray));
-    f.render_widget(footer, chunks[5]);
+    f.render_widget(footer, chunks[4]);
 }
 
 fn format_uptime(secs: u64) -> String {
     let h = secs / 3600;
     let m = (secs % 3600) / 60;
-    format!("{}h{}m", h, m)
+    let s = secs % 60;
+    format!("{}h{}m{}s", h, m, s)
 }

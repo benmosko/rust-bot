@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>Positions</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --fg: #e6edf3;
+      --muted: #8b949e;
+      --accent: #58a6ff;
+      --card: #161b22;
+      --border: #30363d;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--fg);
+      min-height: 100vh;
+      padding: 12px 14px 20px;
+    }
+    h1 {
+      font-size: 1rem;
+      font-weight: 600;
+      margin: 0 0 12px;
+      color: var(--muted);
+    }
+    .err {
+      color: #f85149;
+      font-size: 0.9rem;
+      margin-bottom: 12px;
+    }
+    .empty {
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+    ul {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+    }
+    li {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 14px;
+      margin-bottom: 10px;
+    }
+    .row {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .sym {
+      font-weight: 600;
+      letter-spacing: 0.02em;
+    }
+    .price {
+      font-variant-numeric: tabular-nums;
+      color: var(--accent);
+    }
+    .timer {
+      font-variant-numeric: tabular-nums;
+      font-size: 1.1rem;
+      font-weight: 600;
+      margin-top: 8px;
+      color: #3fb950;
+    }
+    .timer.warn { color: #d29922; }
+    .timer.crit { color: #f85149; }
+    footer {
+      margin-top: 16px;
+      font-size: 0.75rem;
+      color: var(--muted);
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <h1>Open positions</h1>
+  <div id="status" class="err"></div>
+  <div id="list"></div>
+  <footer>Updates every second on your device</footer>
+  <script>
+    (function () {
+      var tg = window.Telegram && window.Telegram.WebApp;
+      if (!tg) {
+        document.getElementById("status").textContent =
+          "Open this page from the Telegram bot (Mini App).";
+        return;
+      }
+      tg.ready();
+      tg.expand();
+
+      var statusEl = document.getElementById("status");
+      var listEl = document.getElementById("list");
+      var serverOffsetSec = 0;
+      var positions = [];
+
+      function nowSec() {
+        return Math.floor(Date.now() / 1000) + serverOffsetSec;
+      }
+
+      function classForRem(sec) {
+        if (sec <= 15) return "timer crit";
+        if (sec <= 60) return "timer warn";
+        return "timer";
+      }
+
+      function render() {
+        if (!positions.length) {
+          listEl.innerHTML = '<p class="empty">No open positions.</p>';
+          return;
+        }
+        var html = "<ul>";
+        for (var i = 0; i < positions.length; i++) {
+          var p = positions[i];
+          var rem = Math.max(0, p.round_end - nowSec());
+          var cls = classForRem(rem);
+          var m = Math.floor(rem / 60);
+          var s = rem % 60;
+          var timeStr = m > 0 ? m + "m " + s + "s" : rem + "s";
+          html +=
+            "<li><div class=\"row\"><span class=\"sym\">" +
+            escapeHtml(p.coin) +
+            " " +
+            escapeHtml(p.period) +
+            " " +
+            escapeHtml(p.side) +
+            '</span><span class="price">@ ' +
+            p.entry_price.toFixed(4) +
+            "</span></div>" +
+            '<div class="' +
+            cls +
+            '">' +
+            timeStr +
+            " left</div></li>";
+        }
+        html += "</ul>";
+        listEl.innerHTML = html;
+      }
+
+      function escapeHtml(t) {
+        var d = document.createElement("div");
+        d.textContent = t;
+        return d.innerHTML;
+      }
+
+      function tick() {
+        render();
+      }
+
+      function load() {
+        var initData = tg.initData || "";
+        if (!initData) {
+          statusEl.textContent = "Missing Telegram session (initData).";
+          return;
+        }
+        statusEl.textContent = "";
+        fetch("/api/telegram-positions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ init_data: initData }),
+        })
+          .then(function (r) {
+            if (!r.ok) return r.text().then(function (t) { throw new Error(t || r.status); });
+            return r.json();
+          })
+          .then(function (data) {
+            var srv = data.server_now;
+            if (typeof srv === "number") {
+              serverOffsetSec = srv - Math.floor(Date.now() / 1000);
+            }
+            positions = data.positions || [];
+            render();
+            setInterval(tick, 1000);
+          })
+          .catch(function (e) {
+            statusEl.textContent = "Could not load positions: " + (e.message || e);
+          });
+      }
+
+      load();
+    })();
+  </script>
+</body>
+</html>

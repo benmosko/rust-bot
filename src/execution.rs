@@ -9,7 +9,8 @@ use chrono::Utc;
 use dashmap::DashMap;
 use polymarket_client_sdk::auth::state::Authenticated;
 use polymarket_client_sdk::auth::Normal;
-use polymarket_client_sdk::clob::types::{OrderType, Side, SignatureType};
+use polymarket_client_sdk::clob::types::response::PostOrderResponse;
+use polymarket_client_sdk::clob::types::{OrderStatusType, OrderType, Side, SignatureType};
 use polymarket_client_sdk::clob::{Client, Config};
 use polymarket_client_sdk::types::{Address, U256};
 use polymarket_client_sdk::POLYGON;
@@ -18,8 +19,9 @@ use rust_decimal::Decimal;
 use std::str::FromStr as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{error, info};
 
 use crate::types::FeeRate;
 
@@ -55,6 +57,35 @@ fn round_price_and_size(price: Decimal, tick_size: Decimal, size: Decimal) -> (D
 }
 
 const CLOB_API_BASE: &str = "https://clob.polymarket.com";
+
+/// Walks `std::error::Error::source` and SDK [`polymarket_client_sdk::error::Error`] to surface
+/// HTTP status and raw API response body (when the SDK used [`polymarket_client_sdk::error::Status`]).
+pub fn format_order_error_for_logs(e: &anyhow::Error) -> String {
+    use polymarket_client_sdk::error::Error as PmErr;
+    use polymarket_client_sdk::error::Status as PmStatus;
+    use std::error::Error as StdError;
+
+    let mut parts = vec![format!("anyhow_chain={:#}", e)];
+    let mut cur: Option<&dyn StdError> = Some(e.as_ref());
+    while let Some(err) = cur {
+        if let Some(pm) = err.downcast_ref::<PmErr>() {
+            parts.push(format!("pm_sdk={pm:?}"));
+            if let Some(st) = pm.downcast_ref::<PmStatus>() {
+                parts.push(format!(
+                    "raw_api status={} {} {} body={}",
+                    st.status_code, st.method, st.path, st.message
+                ));
+            }
+        } else if let Some(st) = err.downcast_ref::<PmStatus>() {
+            parts.push(format!(
+                "raw_api status={} {} {} body={}",
+                st.status_code, st.method, st.path, st.message
+            ));
+        }
+        cur = err.source();
+    }
+    parts.join(" | ")
+}
 
 type AuthenticatedClient = Client<Authenticated<Normal>>;
 
@@ -158,30 +189,52 @@ impl ExecutionEngine {
         Ok(fee_data.fee_rate_bps)
     }
 
-    /// Place a maker limit order. All order ops go through this Mutex for nonce safety.
-    pub async fn place_order(
+    /// Limit order (GTC, FAK, FOK, …). All order ops go through this Mutex for nonce safety.
+    /// For BUY, `post_order` returns `making_amount` ≈ USDC spent and `taking_amount` ≈ shares received.
+    pub async fn place_limit_order(
         &self,
         token_id: &str,
         side: Side,
         price: Decimal,
         size: Decimal,
         tick_size: Decimal,
-    ) -> Result<String> {
-        // Round price to tick_size precision and size to 2 decimal places
+        order_type: OrderType,
+    ) -> Result<PostOrderResponse> {
+        let e0 = Instant::now();
+
         let (rounded_price, rounded_size) = round_price_and_size(price, tick_size, size);
 
         if self.dry_run.load(Ordering::Relaxed) {
+            let (making_amount, taking_amount) = if side == Side::Buy {
+                (
+                    (rounded_size * rounded_price).round_dp(6),
+                    rounded_size,
+                )
+            } else {
+                (
+                    rounded_size,
+                    (rounded_size * rounded_price).round_dp(6),
+                )
+            };
             info!(
                 side = ?side,
+                order_type = ?order_type,
                 price = %rounded_price,
-                original_price = %price,
                 size = %rounded_size,
-                original_size = %size,
+                making = %making_amount,
+                taking = %taking_amount,
                 market = %token_id,
-                "DRY RUN: would place order"
+                "DRY RUN: would place limit order"
             );
-            // Return a fake order ID
-            return Ok(format!("dry_run_order_{}", Utc::now().timestamp_millis()));
+            return Ok(
+                PostOrderResponse::builder()
+                    .making_amount(making_amount)
+                    .taking_amount(taking_amount)
+                    .order_id(format!("dry_run_order_{}", Utc::now().timestamp_millis()))
+                    .status(OrderStatusType::Matched)
+                    .success(true)
+                    .build(),
+            );
         }
 
         let token_id_u256 = U256::from_str(token_id).context("Invalid token_id for order")?;
@@ -195,37 +248,83 @@ impl ExecutionEngine {
             .limit_order()
             .token_id(token_id_u256)
             .size(size_sdk)
-            .price(polymarket_client_sdk::types::Decimal::from_str_exact(rounded_price.to_string().as_str()).context("Invalid price")?)
+            .price(
+                polymarket_client_sdk::types::Decimal::from_str_exact(rounded_price.to_string().as_str())
+                    .context("Invalid price")?,
+            )
             .side(side)
-            .order_type(OrderType::GTC)
+            .order_type(order_type.clone())
             .build()
             .await
             .context("Failed to build order")?;
+
+        let e1 = Instant::now();
 
         let signed_order = client
             .sign(self.signer.as_ref(), order)
             .await
             .context("Failed to sign order")?;
 
-        let response = client
-            .post_order(signed_order)
-            .await
-            .context("Failed to post order")?;
+        let e2 = Instant::now();
 
-        let order_id = response.order_id.clone();
+        let response = match client.post_order(signed_order).await {
+            Ok(r) => r,
+            Err(sdk_err) => {
+                let ae = anyhow::Error::new(sdk_err).context("Failed to post order");
+                error!(
+                    token_id = %token_id,
+                    side = ?side,
+                    price = %rounded_price,
+                    size = %rounded_size,
+                    order_type = ?order_type,
+                    err = ?ae,
+                    detail = %format_order_error_for_logs(&ae),
+                    "Gab: post_order failed (raw API body in `detail` when present)"
+                );
+                return Err(ae);
+            }
+        };
+
+        let e3 = Instant::now();
+
+        info!(
+            token_id = %token_id,
+            "EXEC LATENCY: build={}us, sign={}us, http_post={}ms, TOTAL={}ms",
+            e1.duration_since(e0).as_micros(),
+            e2.duration_since(e1).as_micros(),
+            e3.duration_since(e2).as_millis(),
+            e3.duration_since(e0).as_millis(),
+        );
 
         info!(
             token_id = %token_id,
             side = ?side,
+            order_type = ?order_type,
             price = %rounded_price,
-            original_price = %price,
             size = %rounded_size,
-            original_size = %size,
-            order_id = %order_id,
+            order_id = %response.order_id,
+            success = response.success,
+            making = %response.making_amount,
+            taking = %response.taking_amount,
             "Order placed"
         );
 
-        Ok(order_id)
+        Ok(response)
+    }
+
+    /// GTC limit order; returns order id only (backward compatible).
+    pub async fn place_order(
+        &self,
+        token_id: &str,
+        side: Side,
+        price: Decimal,
+        size: Decimal,
+        tick_size: Decimal,
+    ) -> Result<String> {
+        let r = self
+            .place_limit_order(token_id, side, price, size, tick_size, OrderType::GTC)
+            .await?;
+        Ok(r.order_id)
     }
 
     pub async fn cancel_order(&self, order_id: &str) -> Result<()> {
@@ -255,6 +354,36 @@ impl ExecutionEngine {
 
         info!("All orders cancelled");
         Ok(())
+    }
+
+    /// Get order status and filled size using the SDK's order() method.
+    /// Returns Option<(status, size_matched)> with `size_matched` from the CLOB (no string round-trip).
+    /// Returns None if the order doesn't exist.
+    pub async fn get_order_status(&self, order_id: &str) -> Result<Option<(String, Decimal)>> {
+        if self.dry_run.load(Ordering::Relaxed) {
+            // In dry run, return a fake status
+            return Ok(Some(("live".to_string(), Decimal::ZERO)));
+        }
+
+        let client = self.client.lock().await;
+        match client.order(order_id).await {
+            Ok(order) => {
+                let status = order.status.to_string();
+                let size_matched = order.size_matched;
+                drop(client);
+                Ok(Some((status, size_matched)))
+            }
+            Err(e) => {
+                drop(client);
+                // If order not found, return None
+                let err_str = e.to_string();
+                if err_str.contains("not found") || err_str.contains("404") {
+                    Ok(None)
+                } else {
+                    Err(e.into())
+                }
+            }
+        }
     }
 
     /// Get a provider with signer for on-chain transactions.

@@ -71,6 +71,23 @@ impl Period {
     }
 }
 
+/// YES/NO leg for sniper in-flight placement deduplication (same market; avoids duplicate posts while `place_order` awaits).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SniperSide {
+    Yes,
+    No,
+}
+
+/// One sniper entry slot per round: blocks duplicate evaluation cycles for the same leg until round rollover.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SniperEntryKey {
+    pub coin: Coin,
+    pub period: Period,
+    pub round_start: i64,
+    pub condition_id: String,
+    pub side: SniperSide,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Market {
     pub condition_id: String,
@@ -147,17 +164,17 @@ impl OrderbookState {
     }
 
     pub fn best_bid(&self) -> Option<Decimal> {
-        self.bids.first().map(|l| l.price)
+        self.bids.iter().map(|l| l.price).max()
     }
 
     #[allow(dead_code)]
     pub fn best_ask(&self) -> Option<Decimal> {
-        self.asks.first().map(|l| l.price)
+        self.asks.iter().map(|l| l.price).min()
     }
 }
 
-/// Pair cost for spread capture (gabagool): (yes_cost + no_cost) / min(yes_qty, no_qty).
-/// Profit guaranteed when pair_cost < 1.0.
+/// Hedged pair cost: (yes_cost + no_cost) / min(yes_qty, no_qty) — cost per matched share pair.
+/// For average-price gabagool metrics, see spread capture (yes_avg + no_avg).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PairCost {
     pub yes_qty: Decimal,
@@ -257,6 +274,28 @@ pub struct TradeResult {
     pub timestamp: DateTime<Utc>,
 }
 
+/// Filled trade entry for P&L tracking and redemption manager
+#[derive(Debug, Clone)]
+pub struct FilledTrade {
+    pub slug: String,
+    pub side: String, // "YES" or "NO" / "Up" or "Down"
+    pub price: Decimal,
+    pub size_matched: Decimal,
+    pub condition_id: String,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// Open position entry - tracks cost until resolution
+#[derive(Debug, Clone)]
+pub struct OpenPosition {
+    pub slug: String,
+    pub condition_id: String,
+    pub side: String, // "YES" or "NO"
+    pub cost: Decimal, // price × size_matched
+    pub size_matched: Decimal,
+    pub timestamp: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BotState {
     pub positions: Vec<Position>,
@@ -300,6 +339,98 @@ impl FeeRate {
     }
 }
 
+// ---- Round history (sniper positions → TUI) ----
+
+/// Settlement state for one sniper position row in Round History.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoundHistoryStatus {
+    /// Sniper filled; hedge not yet filled (or round not yet settled for unhedged).
+    Open,
+    /// Both legs filled; P&L from locked pair cost.
+    Hedged,
+    /// Unhedged winner after round resolution.
+    Won,
+    /// Unhedged loser after round resolution.
+    Lost,
+}
+
+/// One row: sniper leg (and optional hedge) for the Round History TUI panel.
+#[derive(Debug, Clone)]
+pub struct RoundHistoryEntry {
+    pub id: String,
+    pub fill_time: DateTime<Utc>,
+    pub coin: Coin,
+    pub period: Period,
+    /// Display "UP" or "DOWN" (sniper / primary leg).
+    pub side_label: String,
+    pub entry_price: Decimal,
+    pub hedge_price: Option<Decimal>,
+    /// Filled hedge size when hedged (for `min(sniper, hedge)` P&L).
+    pub hedge_shares: Option<Decimal>,
+    pub pair_cost: Option<Decimal>,
+    /// Sniper (primary) filled shares.
+    pub shares: Decimal,
+    /// `None` while status is OPEN and not yet valued; set for HEDGED and after Gamma resolution for WON/LOST.
+    pub pnl: Option<Decimal>,
+    pub status: RoundHistoryStatus,
+    pub condition_id: String,
+    pub round_start: i64,
+    pub round_end: i64,
+}
+
+impl RoundHistoryEntry {
+    /// Unhedged win after resolution: `(1 - entry_price) * shares`.
+    pub fn pnl_if_resolved_won(&self) -> Decimal {
+        (Decimal::ONE - self.entry_price) * self.shares
+    }
+
+    /// Unhedged loss after resolution: `-(entry_price * shares)`.
+    pub fn pnl_if_resolved_lost(&self) -> Decimal {
+        -(self.entry_price * self.shares)
+    }
+
+    /// Unhedged win: `(1 - entry) * shares`. Unhedged loss: `-entry * shares`.
+    pub fn pnl_unhedged_if_resolved(&self, up_won: bool) -> Decimal {
+        let pos_up = self.side_label == "UP";
+        let won = (up_won && pos_up) || (!up_won && !pos_up);
+        if won {
+            self.pnl_if_resolved_won()
+        } else {
+            self.pnl_if_resolved_lost()
+        }
+    }
+
+    /// Session P&L: sum of `pnl` where set (hedged arb or resolved unhedged). OPEN rows contribute nothing.
+    pub fn sum_session_pnl(entries: &[RoundHistoryEntry]) -> Decimal {
+        entries.iter().filter_map(|e| e.pnl).sum()
+    }
+
+    /// Resolved positions: entries with realized P&L (hedged or post-resolution).
+    pub fn resolved_trades_count(entries: &[RoundHistoryEntry]) -> u64 {
+        entries.iter().filter(|e| e.pnl.is_some()).count() as u64
+    }
+
+    /// Win rate: (HEDGED + WON) / resolved count × 100. LOST counts as resolved but not a win.
+    pub fn session_win_rate_pct(entries: &[RoundHistoryEntry]) -> f64 {
+        let mut resolved = 0usize;
+        let mut wins = 0usize;
+        for e in entries {
+            if e.pnl.is_none() {
+                continue;
+            }
+            resolved += 1;
+            if matches!(e.status, RoundHistoryStatus::Hedged | RoundHistoryStatus::Won) {
+                wins += 1;
+            }
+        }
+        if resolved == 0 {
+            0.0
+        } else {
+            (wins as f64 / resolved as f64) * 100.0
+        }
+    }
+}
+
 // ---- TUI dashboard state and events ----
 
 /// Events sent from bot modules to the TUI over a single mpsc channel.
@@ -327,15 +458,14 @@ pub enum TuiEvent {
     TradeLog(String),
     /// Cumulative P&L (e.g. daily).
     PnlUpdate(Decimal),
-    /// Session stats: trades count, rounds count, win rate, uptime, rebates, pnl_pct, etc.
+    /// Session stats: uptime, rebates, etc. Header P&L / win / trades are derived from `round_history` in the TUI.
     SessionStats {
-        trades: u64,
         rounds: u64,
-        win_rate_pct: f64,
-        pnl_pct: f64,
         uptime_secs: u64,
         avg_pair_cost: Option<Decimal>,
         rebates: Decimal,
+        /// Starting wallet balance for session return % (header: session P&L / this).
+        session_start_balance: Decimal,
     },
     /// Invested amount (open positions value).
     #[allow(dead_code)]
@@ -371,24 +501,46 @@ pub struct TuiSpreadRow {
 }
 
 /// All dashboard state consumed by the TUI.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct TuiData {
+    /// Rows shown in Active Rounds (from `COINS` × `PERIODS`); avoids fake Waiting rows for markets the bot does not track.
+    pub market_slots: Vec<(Coin, Period)>,
+    /// Session start time for computing uptime on every render (Instant::now() - session_start).
+    pub session_start: std::time::Instant,
     pub balance: Decimal,
     pub invested: Decimal,
     pub open_pos: usize,
-    pub pnl: Decimal,
-    pub pnl_pct: f64,
-    pub win_rate_pct: f64,
-    pub trades: u64,
     pub rounds: u64,
-    pub uptime_secs: u64,
     pub avg_pair_cost: Option<Decimal>,
     pub rebates: Decimal,
+    /// Used with event-driven session P&L from round history to show return vs starting balance.
+    pub session_start_balance: Decimal,
     pub active_rounds: Vec<TuiRoundRow>,
     pub spread_captures: Vec<TuiSpreadRow>,
     pub pnl_history: Vec<f64>,
     pub trade_log: Vec<String>,
     pub paused: bool,
+}
+
+impl Default for TuiData {
+    fn default() -> Self {
+        Self {
+            market_slots: Vec::new(),
+            session_start: std::time::Instant::now(),
+            balance: Decimal::ZERO,
+            invested: Decimal::ZERO,
+            open_pos: 0,
+            rounds: 0,
+            avg_pair_cost: None,
+            rebates: Decimal::ZERO,
+            session_start_balance: Decimal::ZERO,
+            active_rounds: Vec::new(),
+            spread_captures: Vec::new(),
+            pnl_history: Vec::new(),
+            trade_log: Vec::new(),
+            paused: false,
+        }
+    }
 }
 
 /// Helper function to generate strategy status key

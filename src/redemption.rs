@@ -2,32 +2,51 @@
 //! Supports both direct EOA (SIGNATURE_TYPE=0) and Gnosis Safe proxy (SIGNATURE_TYPE=2).
 
 use crate::execution::ExecutionEngine;
-use crate::market_discovery;
-use crate::types::{Coin, Market, Period};
+use crate::pnl::PnLManager;
+use crate::types::{Coin, Market, Period, TuiEvent};
 use anyhow::{Context, Result};
 use alloy::primitives::{B256, Bytes, U256 as AlloyU256};
-use alloy::providers::ProviderBuilder;
+use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::LocalSigner as AlloyLocalSigner;
 use alloy::signers::Signer as AlloySigner;
-use chrono::Utc;
 use polymarket_client_sdk::types::{Address, U256};
 use polymarket_client_sdk::POLYGON;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal_macros::dec;
+use std::collections::HashMap;
 use std::str::FromStr as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 use tracing::info;
+use chrono::Local;
 
 // Contract addresses (Polygon mainnet)
 #[allow(dead_code)]
 const CTF_EXCHANGE: &str = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
 #[allow(dead_code)]
 const NEG_RISK_CTF_EXCHANGE: &str = "0xC5d563A36AE78145C45a50134d48A1215220f80a";
-#[allow(dead_code)]
+// Conditional Tokens contract (CTF) - used for direct redemption
 const CONDITIONAL_TOKENS: &str = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
+// Multicall3 - batch CTF.redeemPositions in one Safe tx (poly_claim uses this)
+const MULTICALL3: &str = "0xcA11bde05977b3631167028862bE2a173976CA11";
+const USDC_COLLATERAL: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+// Uniswap V3 and POL funding (poly_claim auto-funds POL when low)
+#[allow(dead_code)]
+const UNISWAP_V3_ROUTER: &str = "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45";
+#[allow(dead_code)]
+const WPOL_ADDR: &str = "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270";
+const POL_THRESHOLD: f64 = 3.0; // Fund when POL < 3.0
+#[allow(dead_code)]
+const USDC_SWAP_AMOUNT: u64 = 4_000_000; // $4 USDC (6 decimals)
+#[allow(dead_code)]
+const POOL_FEE: u32 = 3000; // 0.3% fee tier
+#[allow(dead_code)]
+const GAS_APPROVE: u64 = 120_000;
+#[allow(dead_code)]
+const GAS_SWAP: u64 = 300_000;
 
 // CTF Exchange ABI (simplified - just the functions we need)
 alloy::sol! {
@@ -48,6 +67,20 @@ alloy::sol! {
             bytes32 conditionId,
             uint256[] calldata indexSets,
             uint256[] calldata amounts
+        ) external;
+    }
+}
+
+// Conditional Tokens contract ABI (4-parameter redeemPositions - no amounts)
+alloy::sol! {
+    #[allow(missing_docs)]
+    #[sol(rpc)]
+    contract ConditionalTokens {
+        function redeemPositions(
+            address collateralToken,
+            bytes32 parentCollectionId,
+            bytes32 conditionId,
+            uint256[] calldata indexSets
         ) external;
     }
 }
@@ -74,6 +107,53 @@ alloy::sol! {
     }
 }
 
+// Multicall3 ABI (poly_claim batches redeems via aggregate3)
+alloy::sol! {
+    #[allow(missing_docs)]
+    #[sol(rpc)]
+    contract Multicall3 {
+        struct Call3 {
+            address target;
+            bool allowFailure;
+            bytes callData;
+        }
+        struct Result {
+            bool success;
+            bytes returnData;
+        }
+        function aggregate3(Call3[] calldata calls) external returns (Result[] memory returnData);
+    }
+}
+
+// ERC1155 balanceOf for CTF (poly_claim skips when balance 0 or partial)
+alloy::sol! {
+    #[allow(missing_docs)]
+    #[sol(rpc)]
+    contract ERC1155 {
+        function balanceOf(address account, uint256 id) external view returns (uint256);
+    }
+}
+
+// ERC20 for USDC (approve, balanceOf, allowance)
+alloy::sol! {
+    #[allow(missing_docs)]
+    #[sol(rpc)]
+    contract ERC20 {
+        function approve(address spender, uint256 amount) external returns (bool);
+        function balanceOf(address account) external view returns (uint256);
+        function allowance(address owner, address spender) external view returns (uint256);
+    }
+}
+
+// Uniswap V3 SwapRouter02 (for POL funding)
+alloy::sol! {
+    #[allow(missing_docs)]
+    #[sol(rpc)]
+    contract SwapRouter02 {
+        function multicall(uint256 deadline, bytes[] calldata data) external payable returns (bytes[] memory results);
+    }
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct GammaMarketResponse {
     #[serde(rename = "conditionID")]
@@ -87,6 +167,39 @@ struct GammaMarketResponse {
     neg_risk: bool,
 }
 
+// Data API Position response (matches Polymarket Data API + poly_claim)
+#[derive(Debug, Clone, serde::Deserialize)]
+struct DataApiPosition {
+    #[serde(rename = "conditionId")]
+    condition_id: String,
+    slug: String,
+    size: f64,
+    #[serde(rename = "currentValue")]
+    current_value: f64,
+    #[serde(rename = "outcomeIndex")]
+    outcome_index: Option<i32>,
+    #[serde(rename = "negativeRisk")]
+    #[allow(dead_code)]
+    negative_risk: Option<bool>,
+    #[allow(dead_code)]
+    title: Option<String>,
+    /// ERC1155 token ID for on-chain balance check (poly_claim uses this to skip already-redeemed/partial)
+    asset: Option<String>,
+}
+
+/// Map Data API `outcomeIndex` to the same side strings used in [`PnLManager::on_fill`]
+/// (`"YES"` / `"NO"`). Polymarket binary markets use index 0 = Yes, 1 = No (see Polymarket docs).
+fn side_label_for_redeemed_position(pos: &DataApiPosition, pnl: &PnLManager) -> String {
+    match pos.outcome_index {
+        Some(0) => "YES".to_string(),
+        Some(1) => "NO".to_string(),
+        _ => pnl
+            .find_position_by_condition_id(&pos.condition_id)
+            .map(|p| p.side)
+            .unwrap_or_else(|| "YES".to_string()),
+    }
+}
+
 pub struct RedemptionManager {
     #[allow(dead_code)]
     execution: Arc<ExecutionEngine>,
@@ -97,10 +210,12 @@ pub struct RedemptionManager {
     #[allow(dead_code)]
     signature_type: u8,
     dry_run: Arc<AtomicBool>,
+    tui_tx: Option<mpsc::Sender<TuiEvent>>,
+    pnl_manager: Arc<PnLManager>,
 }
 
 impl RedemptionManager {
-    pub fn new(execution: Arc<ExecutionEngine>, rpc_url: String, funder_address: Address, dry_run: Arc<AtomicBool>) -> Self {
+    pub fn new(execution: Arc<ExecutionEngine>, rpc_url: String, funder_address: Address, dry_run: Arc<AtomicBool>, tui_tx: Option<mpsc::Sender<TuiEvent>>, pnl_manager: Arc<PnLManager>) -> Self {
         // Get signature_type from execution engine
         let signature_type = execution.signature_type();
         Self {
@@ -109,6 +224,8 @@ impl RedemptionManager {
             funder_address,
             signature_type,
             dry_run,
+            tui_tx,
+            pnl_manager,
         }
     }
 
@@ -170,12 +287,14 @@ impl RedemptionManager {
     }
 
     /// Sign a Gnosis Safe transaction using EIP-712.
+    /// operation: 0 = Call, 1 = DelegateCall (e.g. for Multicall3).
     #[allow(dead_code)]
     async fn sign_safe_transaction(
         &self,
         safe_address: Address,
         to: Address,
         data: Bytes,
+        operation: u8,
         nonce: AlloyU256,
     ) -> Result<Bytes> {
         use alloy::primitives::keccak256;
@@ -209,7 +328,7 @@ impl RedemptionManager {
         safe_tx_data.extend_from_slice(&AlloyU256::ZERO.to_be_bytes::<32>()); // value
         safe_tx_data.extend_from_slice(data_hash.as_slice()); // data hash
         safe_tx_data.extend_from_slice(&[0u8; 31]); // operation (uint8, padded to 32 bytes)
-        safe_tx_data.push(0u8); // operation = 0 (Call)
+        safe_tx_data.push(operation); // 0 = Call, 1 = DelegateCall
         safe_tx_data.extend_from_slice(&AlloyU256::ZERO.to_be_bytes::<32>()); // safeTxGas
         safe_tx_data.extend_from_slice(&AlloyU256::ZERO.to_be_bytes::<32>()); // baseGas
         safe_tx_data.extend_from_slice(&AlloyU256::ZERO.to_be_bytes::<32>()); // gasPrice
@@ -249,12 +368,14 @@ impl RedemptionManager {
     }
 
     /// Execute a transaction through Gnosis Safe execTransaction.
+    /// operation: 0 = Call, 1 = DelegateCall (e.g. for Multicall3).
     #[allow(dead_code)]
     async fn exec_safe_transaction(
         &self,
         safe_address: Address,
         to: Address,
         data: Bytes,
+        operation: u8,
     ) -> Result<()> {
         // Get provider
         let rpc_url: url::Url = self.rpc_url.parse()
@@ -271,7 +392,7 @@ impl RedemptionManager {
         let nonce = nonce_result;
         
         // Sign the transaction
-        let signatures = self.sign_safe_transaction(safe_address, to, data.clone(), nonce).await
+        let signatures = self.sign_safe_transaction(safe_address, to, data.clone(), operation, nonce).await
             .context("Failed to sign Safe transaction")?;
         
         // Create alloy signer for sending the transaction
@@ -290,7 +411,7 @@ impl RedemptionManager {
             to,
             AlloyU256::ZERO, // value
             data,
-            0u8, // operation (0 = Call)
+            operation, // 0 = Call, 1 = DelegateCall
             AlloyU256::ZERO, // safeTxGas
             AlloyU256::ZERO, // baseGas
             AlloyU256::ZERO, // gasPrice
@@ -335,6 +456,408 @@ impl RedemptionManager {
             .context("Failed to parse Gamma API response")?;
 
         Ok(markets.first().and_then(|m| m.closed).unwrap_or(false))
+    }
+
+    /// Fetch redeemable positions from Polymarket Data API.
+    async fn fetch_redeemable_positions(&self) -> Result<Vec<DataApiPosition>> {
+        let url = format!(
+            "https://data-api.polymarket.com/positions?user={}&redeemable=true&sizeThreshold=0&limit=500",
+            self.funder_address.to_string()
+        );
+        let client = reqwest::Client::new();
+        let response = client
+            .get(&url)
+            .send()
+            .await
+            .context("Failed to fetch positions from Data API")?;
+
+        if !response.status().is_success() {
+            anyhow::bail!("Data API returned status: {}", response.status());
+        }
+
+        let positions: Vec<DataApiPosition> = response
+            .json()
+            .await
+            .context("Failed to parse Data API response")?;
+
+        Ok(positions)
+    }
+
+    /// On-chain CTF ERC1155 balance in shares (poly_claim: skip if 0 or partial).
+    /// Returns None on RPC/parse error, Some(shares) with shares = raw/1e6.
+    async fn get_ctf_balance_shares(&self, owner: &str, asset_id: &str) -> Option<f64> {
+        let token_id = match asset_id.parse::<u64>() {
+            Ok(id) => AlloyU256::from(id),
+            Err(_) => return None,
+        };
+        let owner_addr = match Address::from_str(owner) {
+            Ok(a) => a,
+            Err(_) => return None,
+        };
+        let ctf_addr = match Address::from_str(CONDITIONAL_TOKENS) {
+            Ok(a) => a,
+            Err(_) => return None,
+        };
+        let rpc_url = match self.rpc_url.parse::<url::Url>() {
+            Ok(u) => u,
+            Err(_) => return None,
+        };
+        let provider = ProviderBuilder::new().connect_http(rpc_url);
+        let provider = Arc::new(provider);
+        let erc1155 = ERC1155::new(ctf_addr, &*provider);
+        let raw = match erc1155.balanceOf(owner_addr, token_id).call().await {
+            Ok(b) => b,
+            Err(_) => return None,
+        };
+        let raw_u64 = raw.to::<u64>();
+        let shares = raw_u64 as f64 / 1e6;
+        Some(shares)
+    }
+
+    /// Build redeemPositions calldata for one condition_id (for multicall/batch).
+    fn build_redeem_calldata(&self, condition_id: &str) -> Result<Bytes> {
+        let usdc_collateral = Address::from_str(USDC_COLLATERAL)?;
+        let condition_id_bytes = if condition_id.starts_with("0x") {
+            let hex = &condition_id[2..];
+            if hex.len() != 64 {
+                anyhow::bail!("Invalid conditionId length: expected 64 hex chars, got {}", hex.len());
+            }
+            let mut bytes = [0u8; 32];
+            hex::decode_to_slice(hex, &mut bytes)
+                .context("Failed to decode conditionId hex")?;
+            B256::from(bytes)
+        } else {
+            if condition_id.len() != 64 {
+                anyhow::bail!("Invalid conditionId length: expected 64 hex chars, got {}", condition_id.len());
+            }
+            let mut bytes = [0u8; 32];
+            hex::decode_to_slice(condition_id, &mut bytes)
+                .context("Failed to decode conditionId hex")?;
+            B256::from(bytes)
+        };
+        let index_sets = vec![AlloyU256::from(1u64), AlloyU256::from(2u64)];
+        use alloy::sol_types::SolCall;
+        let call_data = ConditionalTokens::redeemPositionsCall {
+            collateralToken: usdc_collateral.into(),
+            parentCollectionId: B256::ZERO,
+            conditionId: condition_id_bytes,
+            indexSets: index_sets,
+        };
+        Ok(Bytes::from(call_data.abi_encode()))
+    }
+
+    /// Redeem a single position using Conditional Tokens contract (4-parameter version).
+    async fn redeem_position_ctf(&self, condition_id: &str, slug: &str, payout: Decimal) -> Result<()> {
+        if self.dry_run.load(Ordering::Relaxed) {
+            info!(
+                market = %slug,
+                condition_id = %condition_id,
+                payout = %payout,
+                "DRY RUN: would redeem position"
+            );
+            return Ok(());
+        }
+
+        let redeem_time = Local::now().format("%H:%M:%S").to_string();
+        let attempt_msg = format!("{} {} REDEEM attempt: ${:.2}", redeem_time, slug, payout);
+        
+        // Send redemption attempt to TUI
+        if let Some(ref tx) = self.tui_tx {
+            let _ = tx.try_send(TuiEvent::TradeLog(attempt_msg.clone()));
+        }
+        
+        info!(
+            market = %slug,
+            condition_id = %condition_id,
+            payout = %payout,
+            signature_type = self.signature_type,
+            "Redeeming position"
+        );
+
+        let ctf_address = Address::from_str(CONDITIONAL_TOKENS)?;
+        let usdc_collateral = Address::from_str("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")?;
+        
+        // Parse condition ID (should be 0x-prefixed 64 hex chars)
+        let condition_id_bytes = if condition_id.starts_with("0x") {
+            let hex = &condition_id[2..];
+            if hex.len() != 64 {
+                anyhow::bail!("Invalid conditionId length: expected 64 hex chars, got {}", hex.len());
+            }
+            let mut bytes = [0u8; 32];
+            hex::decode_to_slice(hex, &mut bytes)
+                .context("Failed to decode conditionId hex")?;
+            B256::from(bytes)
+        } else {
+            // Try parsing as hex without 0x prefix
+            if condition_id.len() != 64 {
+                anyhow::bail!("Invalid conditionId length: expected 64 hex chars, got {}", condition_id.len());
+            }
+            let mut bytes = [0u8; 32];
+            hex::decode_to_slice(condition_id, &mut bytes)
+                .context("Failed to decode conditionId hex")?;
+            B256::from(bytes)
+        };
+
+        // Index sets: [1, 2] redeems all winning positions (YES and NO outcomes)
+        let index_sets = vec![AlloyU256::from(1u64), AlloyU256::from(2u64)];
+
+        // Branch on signature type
+        if self.signature_type == 2 {
+            // Gnosis Safe path: use execTransaction
+            // Build inner calldata for ConditionalTokens.redeemPositions
+            use alloy::sol_types::SolCall;
+            let call_data = ConditionalTokens::redeemPositionsCall {
+                collateralToken: usdc_collateral.into(),
+                parentCollectionId: B256::ZERO,
+                conditionId: condition_id_bytes,
+                indexSets: index_sets.clone(),
+            };
+            let inner_calldata = Bytes::from(call_data.abi_encode());
+            
+            self.exec_safe_transaction(self.funder_address, ctf_address, inner_calldata, 0u8).await
+                .context("Failed to execute Safe transaction for redeemPositions")?;
+            
+            // Send success message for Gnosis Safe path
+            let success_time = Local::now().format("%H:%M:%S").to_string();
+            let success_msg = format!("{} {} REDEEM success: ${:.2}", success_time, slug, payout);
+            
+            if let Some(ref tx) = self.tui_tx {
+                let _ = tx.try_send(TuiEvent::TradeLog(success_msg.clone()));
+            }
+        } else {
+            // Direct EOA path
+            let provider = self.execution.get_provider_with_signer(&self.rpc_url)
+                .context("Failed to create provider with signer")?;
+            let provider = Arc::new(provider);
+
+            // Build contract instance
+            let contract = ConditionalTokens::new(ctf_address, &*provider);
+
+            // Call redeemPositions (4 parameters, no amounts)
+            let call = contract.redeemPositions(
+                usdc_collateral,
+                B256::ZERO, // parentCollectionId (typically 0)
+                condition_id_bytes,
+                index_sets,
+            );
+
+            // Send the transaction
+            let pending = call.send().await
+                .context("Failed to send redeemPositions transaction")?;
+            
+            let receipt = pending.get_receipt().await
+                .context("Failed to get transaction receipt")?;
+
+            let success_time = Local::now().format("%H:%M:%S").to_string();
+            let success_msg = format!("{} {} REDEEM success: ${:.2}", success_time, slug, payout);
+            
+            // Send redemption success to TUI
+            if let Some(ref tx) = self.tui_tx {
+                let _ = tx.try_send(TuiEvent::TradeLog(success_msg.clone()));
+            }
+            
+            info!(
+                market = %slug,
+                condition_id = %condition_id,
+                payout = %payout,
+                tx_hash = ?receipt.transaction_hash,
+                "Redeemed position successfully"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Try to redeem multiple CIDs in one Safe tx via Multicall3 (poly_claim path).
+    /// On success returns all cids as succeeded. On failure returns Err (caller can fall back to batch/single).
+    async fn try_redeem_multicall_via_safe(&self, cids: &[String]) -> Result<Vec<String>> {
+        if cids.is_empty() {
+            return Ok(vec![]);
+        }
+        let ctf_address = Address::from_str(CONDITIONAL_TOKENS)?;
+        let mc3_address = Address::from_str(MULTICALL3)?;
+        let mut calls = Vec::with_capacity(cids.len());
+        for cid in cids {
+            let call_data = self.build_redeem_calldata(cid)?;
+            calls.push(Multicall3::Call3 {
+                target: ctf_address,
+                allowFailure: true,
+                callData: call_data,
+            });
+        }
+        use alloy::sol_types::SolCall;
+        let aggregate_calldata = Multicall3::aggregate3Call { calls }.abi_encode();
+        self.exec_safe_transaction(
+            self.funder_address,
+            mc3_address,
+            Bytes::from(aggregate_calldata),
+            1u8, // DelegateCall
+        )
+        .await
+        .context("Multicall redeem failed")?;
+        Ok(cids.to_vec())
+    }
+
+    /// Batch redeem through Safe: build all Safe execTransaction calls with incrementing nonces,
+    /// execute them in parallel (poly_claim path). Returns HashMap<cid, success>.
+    /// Simplified: uses existing exec_safe_transaction but with manual nonce management.
+    async fn try_redeem_batch_via_safe(&self, cids: &[String]) -> HashMap<String, bool> {
+        if cids.is_empty() {
+            return HashMap::new();
+        }
+
+        let rpc_url: url::Url = match self.rpc_url.parse() {
+            Ok(u) => u,
+            Err(_) => return cids.iter().map(|c| (c.clone(), false)).collect(),
+        };
+        let provider = Arc::new(ProviderBuilder::new().connect_http(rpc_url.clone()));
+        let safe_contract = GnosisSafe::new(self.funder_address, &*provider);
+
+        // Get initial Safe nonce
+        let safe_nonce = match safe_contract.nonce().call().await {
+            Ok(n) => n,
+            Err(_) => return cids.iter().map(|c| (c.clone(), false)).collect(),
+        };
+
+        let ctf_address = match Address::from_str(CONDITIONAL_TOKENS) {
+            Ok(a) => a,
+            Err(_) => return cids.iter().map(|c| (c.clone(), false)).collect(),
+        };
+        let mut results = HashMap::new();
+
+        // Execute all redeems sequentially with incrementing nonces
+        for (i, cid) in cids.iter().enumerate() {
+            let call_data = match self.build_redeem_calldata(cid) {
+                Ok(cd) => cd,
+                Err(_) => continue,
+            };
+            
+            // Sequential execution (simpler than parallel, still correct)
+            let nonce_i = safe_nonce + AlloyU256::from(i as u64);
+            
+            // Sign with nonce + i
+            let signatures = match self.sign_safe_transaction(
+                self.funder_address,
+                ctf_address,
+                call_data.clone(),
+                0u8,
+                nonce_i,
+            ).await {
+                Ok(sig) => sig,
+                Err(e) => {
+                    tracing::warn!(cid = %cid, error = %e, "Sign failed");
+                    results.insert(cid.clone(), false);
+                    continue;
+                }
+            };
+            
+            // Execute
+            let alloy_signer = match AlloyLocalSigner::from_str(&self.execution.private_key())
+                .map(|s| s.with_chain_id(Some(POLYGON))) {
+                Ok(s) => s,
+                Err(_) => {
+                    results.insert(cid.clone(), false);
+                    continue;
+                }
+            };
+            
+            let provider_with_signer = ProviderBuilder::new()
+                .wallet(alloy_signer)
+                .connect_http(self.rpc_url.parse::<url::Url>().unwrap());
+            let provider_with_signer = Arc::new(provider_with_signer);
+            
+            let safe_contract_exec = GnosisSafe::new(self.funder_address, &*provider_with_signer);
+            let call = safe_contract_exec.execTransaction(
+                ctf_address,
+                AlloyU256::ZERO,
+                call_data,
+                0u8,
+                AlloyU256::ZERO,
+                AlloyU256::ZERO,
+                AlloyU256::ZERO,
+                Address::ZERO,
+                Address::ZERO,
+                signatures,
+            );
+            
+            match call.send().await {
+                Ok(pending) => {
+                    match pending.get_receipt().await {
+                        Ok(_) => {
+                            results.insert(cid.clone(), true);
+                        }
+                        Err(e) => {
+                            let err_str: String = e.to_string().to_lowercase();
+                            if err_str.contains("nonce") || err_str.contains("already") {
+                                results.insert(cid.clone(), true);
+                            } else {
+                                tracing::warn!(cid = %cid, error = %e, "Receipt failed");
+                                results.insert(cid.clone(), false);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    let err_str: String = e.to_string().to_lowercase();
+                    if err_str.contains("nonce") || err_str.contains("already") {
+                        results.insert(cid.clone(), true);
+                    } else {
+                        tracing::warn!(cid = %cid, error = %e, "Send failed");
+                        results.insert(cid.clone(), false);
+                    }
+                }
+            }
+        }
+
+        results
+    }
+
+    /// Get POL balance for EOA (poly_claim checks this before redeeming).
+    async fn get_pol_balance(&self, eoa: &str) -> Option<f64> {
+        let eoa_addr = match Address::from_str(eoa) {
+            Ok(a) => a,
+            Err(_) => return None,
+        };
+        let rpc_url: url::Url = match self.rpc_url.parse() {
+            Ok(u) => u,
+            Err(_) => return None,
+        };
+        let provider = ProviderBuilder::new().connect_http(rpc_url);
+        match provider.get_balance(eoa_addr.into()).await {
+            Ok(bal) => Some(bal.to::<u128>() as f64 / 1e18),
+            Err(_) => None,
+        }
+    }
+
+    /// Auto-fund POL when balance is low (poly_claim: swaps USDC->POL via Uniswap V3).
+    /// Returns true if funded or already sufficient, false on error.
+    /// Note: Full Uniswap V3 swap encoding is complex; this checks balance and logs.
+    async fn auto_fund_pol(&self) -> bool {
+        // Get EOA address
+        let alloy_signer = match AlloyLocalSigner::from_str(&self.execution.private_key())
+            .map(|s| s.with_chain_id(Some(POLYGON))) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let eoa = alloy_signer.address();
+        let eoa_str = eoa.to_string();
+
+        // Check POL balance
+        let pol_bal = match self.get_pol_balance(&eoa_str).await {
+            Some(b) => b,
+            None => {
+                tracing::warn!("Could not check POL balance");
+                return false;
+            }
+        };
+
+        if pol_bal >= POL_THRESHOLD {
+            return true; // Already sufficient
+        }
+
+        info!("EOA has {:.4} POL (< {:.1}), would fund via Uniswap V3 (not fully implemented)", pol_bal, POL_THRESHOLD);
+        // TODO: Implement full Uniswap V3 SwapRouter02 multicall (exactInputSingle + unwrapWETH9)
+        false
     }
 
     /// Redeem winning positions.
@@ -408,7 +931,7 @@ impl RedemptionManager {
                 amounts_u256,
             )?;
             
-            self.exec_safe_transaction(self.funder_address, exchange_addr, inner_calldata).await
+            self.exec_safe_transaction(self.funder_address, exchange_addr, inner_calldata, 0u8).await
                 .context("Failed to execute Safe transaction for redeemPositions")?;
         } else {
             // Direct EOA path
@@ -530,7 +1053,7 @@ impl RedemptionManager {
                 amounts_u256,
             )?;
             
-            self.exec_safe_transaction(self.funder_address, exchange_addr, inner_calldata).await
+            self.exec_safe_transaction(self.funder_address, exchange_addr, inner_calldata, 0u8).await
                 .context("Failed to execute Safe transaction for mergePositions")?;
         } else {
             // Direct EOA path
@@ -584,46 +1107,257 @@ impl RedemptionManager {
         Ok(())
     }
 
-    /// Background loop: check resolved markets every 15s and redeem/merge.
+    /// Background loop: check for redeemable positions every 3s (poly_claim). Balance filter + multicall then single.
+    /// Each position is retried up to 5 times before giving up.
     pub async fn run(
         &self,
         shutdown: tokio_util::sync::CancellationToken,
-        coins: &[Coin],
-        periods: &[Period],
+        _coins: &[Coin],
+        _periods: &[Period],
     ) -> Result<()> {
-        info!("Redemption manager started");
+        const POLL_INTERVAL_SECS: u64 = 3;
+        const MAX_RETRIES_PER_POSITION: u32 = 5;
+        let funder = self.funder_address.to_string();
+
+        info!("Redemption manager started (polling every {}s, max {} retries per position, poly_claim flow)", POLL_INTERVAL_SECS, MAX_RETRIES_PER_POSITION);
+
+        let mut retry_count: HashMap<String, u32> = HashMap::new();
 
         loop {
             if shutdown.is_cancelled() {
                 break;
             }
 
-            let now = Utc::now().timestamp();
+            // Fetch redeemable positions from Data API (same API as poly_claim)
+            match self.fetch_redeemable_positions().await {
+                Ok(positions) => {
+                    // Filter to worthwhile (currentValue >= 0.01, size >= 0.01) and not given up
+                    let worthwhile: Vec<_> = positions
+                        .into_iter()
+                        .filter(|p| {
+                            p.current_value >= 0.01
+                                && p.size >= 0.01
+                                && *retry_count.get(&p.condition_id).unwrap_or(&0) < MAX_RETRIES_PER_POSITION
+                        })
+                        .collect();
 
-            // Check recent rounds (last 24 hours)
-            for coin in coins {
-                for period in periods {
-                    let period_secs = period.as_seconds();
-                    // Check last 10 rounds
-                    for i in 0..10 {
-                        let round_start = ((now / period_secs) - i) * period_secs;
-                        let slug = market_discovery::generate_slug(*coin, *period, round_start);
+                    if worthwhile.is_empty() {
+                        sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
+                        continue;
+                    }
 
-                        if let Ok(resolved) = self.is_market_resolved(&slug).await {
-                            if resolved {
-                                // In production: query positions for this market and redeem/merge
-                                // For now, just log
+                    // On-chain balance filter (poly_claim): skip if balance 0 or partial
+                    let mut valid: Vec<DataApiPosition> = {
+                        let mut out = Vec::with_capacity(worthwhile.len());
+                        for pos in worthwhile {
+                            let cid = pos.condition_id.clone();
+                            let size = pos.size;
+                            let has_asset = pos.asset.as_ref().map(|a| !a.is_empty()).unwrap_or(false);
+                            if !has_asset {
+                                out.push(pos);
+                                continue;
+                            }
+                            let asset_id = pos.asset.as_ref().unwrap();
+                            match self.get_ctf_balance_shares(&funder, asset_id).await {
+                                None => {
+                                    tracing::debug!(cid = %cid, "CTF balance RPC error, skipping");
+                                }
+                                Some(0.0) => {
+                                    info!(cid = %cid, "SKIP on-chain balance=0 (already redeemed/sold)");
+                                }
+                                Some(chain_bal) if chain_bal < size * 0.5 => {
+                                    info!(cid = %cid, chain_bal = %chain_bal, size = %size, "SKIP partial sold");
+                                }
+                                Some(_) => out.push(pos),
+                            }
+                        }
+                        out
+                    };
+
+                    if valid.is_empty() {
+                        sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
+                        continue;
+                    }
+
+                    info!(
+                        count = valid.len(),
+                        total_value = valid.iter().map(|p| p.current_value).sum::<f64>(),
+                        "Found redeemable positions (after balance filter)"
+                    );
+
+                    // Check POL balance and fund if needed (poly_claim does this before redeeming)
+                    if self.signature_type == 2 {
+                        let _ = self.auto_fund_pol().await; // Non-fatal if funding fails
+                    }
+
+                    // Safe path: try multicall first (poly_claim), then batch, then single
+                    if self.signature_type == 2 && !valid.is_empty() {
+                        let cids: Vec<String> = valid.iter().map(|p| p.condition_id.clone()).collect();
+                        if let Ok(redeemed_cids) = self.try_redeem_multicall_via_safe(&cids).await {
+                            for cid in &redeemed_cids {
+                                retry_count.remove(cid);
+                            }
+                            for pos in &valid {
+                                if redeemed_cids.contains(&pos.condition_id) {
+                                    let condition_id = pos.condition_id.clone();
+                                    let slug = pos.slug.clone();
+                                    let payout = Decimal::try_from(pos.current_value)
+                                        .unwrap_or_else(|_| Decimal::from_f64_retain(pos.current_value).unwrap_or(Decimal::ZERO));
+                                    let side = side_label_for_redeemed_position(pos, &self.pnl_manager);
+                                    if let Some(trade_pnl) = self.pnl_manager.on_resolve(&condition_id, &side, payout) {
+                                        let win_lose = if payout > Decimal::ZERO { "WON" } else { "LOST" };
+                                        let pnl_time = Local::now().format("%H:%M:%S").to_string();
+                                        let pnl_msg = format!("{} {} {} P&L: ${:+.2} (payout: ${:.2})", pnl_time, slug, win_lose, trade_pnl, payout);
+                                        if let Some(ref tx) = self.tui_tx {
+                                            let _ = tx.try_send(TuiEvent::TradeLog(pnl_msg));
+                                        }
+                                    }
+                                    if let Some(ref tx) = self.tui_tx {
+                                        let _ = tx.try_send(TuiEvent::TradeLog(format!("{} {} REDEEM success: ${:.2}", Local::now().format("%H:%M:%S"), slug, payout)));
+                                    }
+                                }
+                            }
+                            info!(count = redeemed_cids.len(), "Multicall redeem success");
+                            sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
+                            continue;
+                        }
+                        tracing::warn!("Multicall redeem failed, trying batch");
+                        // Try batch redeem (poly_claim fallback)
+                        let batch_results = self.try_redeem_batch_via_safe(&cids).await;
+                        let mut remaining = Vec::new();
+                        for pos in &valid {
+                            let cid = &pos.condition_id;
+                            if let Some(&success) = batch_results.get(cid) {
+                                if success {
+                                    retry_count.remove(cid);
+                                    let condition_id = pos.condition_id.clone();
+                                    let slug = pos.slug.clone();
+                                    let payout = Decimal::try_from(pos.current_value)
+                                        .unwrap_or_else(|_| Decimal::from_f64_retain(pos.current_value).unwrap_or(Decimal::ZERO));
+                                    let side = side_label_for_redeemed_position(pos, &self.pnl_manager);
+                                    if let Some(trade_pnl) = self.pnl_manager.on_resolve(&condition_id, &side, payout) {
+                                        let win_lose = if payout > Decimal::ZERO { "WON" } else { "LOST" };
+                                        let pnl_time = Local::now().format("%H:%M:%S").to_string();
+                                        let pnl_msg = format!("{} {} {} P&L: ${:+.2} (payout: ${:.2})", pnl_time, slug, win_lose, trade_pnl, payout);
+                                        if let Some(ref tx) = self.tui_tx {
+                                            let _ = tx.try_send(TuiEvent::TradeLog(pnl_msg));
+                                        }
+                                    }
+                                    if let Some(ref tx) = self.tui_tx {
+                                        let _ = tx.try_send(TuiEvent::TradeLog(format!("{} {} REDEEM success: ${:.2}", Local::now().format("%H:%M:%S"), slug, payout)));
+                                    }
+                                } else {
+                                    remaining.push((*pos).clone());
+                                }
+                            } else {
+                                remaining.push((*pos).clone());
+                            }
+                        }
+                        info!(batch_succeeded = batch_results.values().filter(|&&v| v).count(), batch_failed = batch_results.values().filter(|&&v| !v).count(), "Batch redeem complete");
+                        // Fall through to single redeem for remaining
+                        valid = remaining;
+                    }
+
+                    // Single redeem per position (EOA or multicall/batch fallback)
+                    for pos in valid {
+                        let condition_id = pos.condition_id.clone();
+                        let slug = pos.slug.clone();
+                        let payout = Decimal::try_from(pos.current_value)
+                            .unwrap_or_else(|_| Decimal::from_f64_retain(pos.current_value).unwrap_or(Decimal::ZERO));
+
+                        let side = side_label_for_redeemed_position(&pos, &self.pnl_manager);
+
+                        match self.redeem_position_ctf(&condition_id, &slug, payout).await {
+                            Ok(()) => {
+                                retry_count.remove(&condition_id);
+                                // When position RESOLVES: Calculate P&L for that trade
+                                // If won: P&L += payout - cost
+                                // If lost: P&L += 0 - cost
+                                // Invested -= cost
+                                // Open Pos -= 1
+                                // Trades += 1
+                                // Update Win rate
+                                if let Some(trade_pnl) = self.pnl_manager.on_resolve(&condition_id, &side, payout) {
+                                    let win_lose = if payout > Decimal::ZERO { "WON" } else { "LOST" };
+                                    let pnl_time = Local::now().format("%H:%M:%S").to_string();
+                                    let pnl_msg = format!(
+                                        "{} {} {} P&L: ${:+.2} (payout: ${:.2})",
+                                        pnl_time, slug, win_lose, trade_pnl, payout
+                                    );
+                                    
+                                    // Send P&L update to TUI
+                                    if let Some(ref tx) = self.tui_tx {
+                                        let _ = tx.try_send(TuiEvent::TradeLog(pnl_msg));
+                                    }
+                                    
+                                    info!(
+                                        market = %slug,
+                                        condition_id = %condition_id,
+                                        side = %side,
+                                        payout = %payout,
+                                        trade_pnl = %trade_pnl,
+                                        "Position resolved, P&L calculated"
+                                    );
+                                } else {
+                                    // Position not found in open positions - might have been resolved already or not tracked
+                                    tracing::warn!(
+                                        market = %slug,
+                                        condition_id = %condition_id,
+                                        "Position resolved but not found in open positions (may have been resolved already)"
+                                    );
+                                }
+
+                                // Success message already sent in redeem_position_ctf
                                 info!(
-                                    slug = %slug,
-                                    "Market resolved, would check positions and redeem"
+                                    market = %slug,
+                                    payout = %payout,
+                                    "Redeemed position"
                                 );
+                            }
+                            Err(e) => {
+                                let count = retry_count.entry(condition_id.clone()).or_insert(0);
+                                *count = count.saturating_add(1);
+                                let attempts = *count;
+                                let fail_time = Local::now().format("%H:%M:%S").to_string();
+                                let fail_msg = format!("{} {} REDEEM failed: ${:.2} — {:#} (attempt {}/{})", fail_time, slug, payout, e, attempts, MAX_RETRIES_PER_POSITION);
+
+                                // Send redemption failure to TUI (full error chain)
+                                if let Some(ref tx) = self.tui_tx {
+                                    let _ = tx.try_send(TuiEvent::TradeLog(fail_msg));
+                                }
+
+                                if attempts >= MAX_RETRIES_PER_POSITION {
+                                    tracing::warn!(
+                                        market = %slug,
+                                        condition_id = %condition_id,
+                                        error = %e,
+                                        error_chain = %format!("{:#}", e),
+                                        "Failed to redeem position after {} attempts, giving up",
+                                        MAX_RETRIES_PER_POSITION
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        market = %slug,
+                                        condition_id = %condition_id,
+                                        error_chain = %format!("{:#}", e),
+                                        attempt = attempts,
+                                        max = MAX_RETRIES_PER_POSITION,
+                                        "Failed to redeem position, will retry next cycle"
+                                    );
+                                }
                             }
                         }
                     }
                 }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Failed to fetch redeemable positions, will retry next cycle"
+                    );
+                }
             }
 
-            sleep(Duration::from_secs(15)).await;
+            sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
         }
 
         Ok(())

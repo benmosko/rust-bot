@@ -29,6 +29,20 @@ pub struct BalanceManager {
     rpc_url: String,
 }
 
+/// Read USDC `balanceOf` for `wallet` on Polygon (same path as [`BalanceManager::refresh_balance`]).
+pub async fn fetch_usdc_balance(rpc_url: &str, wallet: Address) -> Result<Decimal> {
+    let rpc_url: url::Url = rpc_url.parse()?;
+    let provider = ProviderBuilder::new().connect_http(rpc_url);
+    let provider = Arc::new(provider);
+
+    let usdc_address = Address::from_str(USDC_POLYGON)?;
+    let contract = ERC20::new(usdc_address, &*provider);
+    let call = contract.balanceOf(wallet);
+    let result = call.call().await.context("Failed to call balanceOf")?;
+    let balance_u128 = result.to::<u128>();
+    Ok(Decimal::from(balance_u128) / dec!(1_000_000))
+}
+
 impl BalanceManager {
     pub fn new(wallet_address: Address, rpc_url: String) -> Self {
         let (sender, receiver) = watch::channel(dec!(0));
@@ -53,24 +67,7 @@ impl BalanceManager {
 
     /// Refresh balance from on-chain USDC contract.
     pub async fn refresh_balance(&self) -> Result<()> {
-        let rpc_url: url::Url = self.rpc_url.parse()?;
-        let provider = ProviderBuilder::new()
-            .connect_http(rpc_url);
-        let provider = Arc::new(provider);
-
-        let usdc_address = Address::from_str(USDC_POLYGON)?;
-        
-        // Create contract instance - with #[sol(rpc)], new() is generated
-        let contract = ERC20::new(usdc_address, &*provider);
-
-        // Call balanceOf
-        let call = contract.balanceOf(self.wallet_address);
-        let result = call.call().await.context("Failed to call balanceOf")?;
-
-        // Convert U256 to Decimal (USDC has 6 decimals)
-        // result is already a Uint<256, 4>, convert directly
-        let balance_u128 = result.to::<u128>();
-        let balance_decimal = Decimal::from(balance_u128) / dec!(1_000_000);
+        let balance_decimal = fetch_usdc_balance(&self.rpc_url, self.wallet_address).await?;
 
         // Update watch channel
         if self.balance_sender.send(balance_decimal).is_err() {
@@ -82,7 +79,7 @@ impl BalanceManager {
         Ok(())
     }
 
-    /// Background loop: refresh balance every 30 seconds.
+    /// Background loop: refresh balance periodically (fills also trigger immediate refresh via PnLManager).
     pub async fn run(
         &self,
         shutdown: tokio_util::sync::CancellationToken,
@@ -99,7 +96,8 @@ impl BalanceManager {
                 break;
             }
 
-            sleep(Duration::from_secs(30)).await;
+            // Shorter interval so the UI stays reasonably fresh even without fill events
+            sleep(Duration::from_secs(10)).await;
 
             if let Err(e) = self.refresh_balance().await {
                 error!(error = %e, "Failed to refresh balance");

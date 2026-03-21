@@ -11,11 +11,23 @@ pub struct Config {
     pub funder_address: Option<String>,
     pub polygon_rpc_url: String,
 
-    // Spread Capture (gabagool)
-    pub sc_target_pair_cost: Decimal,
+    // Spread Capture (gabagool) — accumulate YES/NO; target yes_avg + no_avg <= max
+    /// Max best_ask on the **first** buy of the round only (no inventory yet). Later buys use only pair-cost + imbalance.
+    pub sc_cheap_side_max_ask: Decimal,
+    /// Max allowed sum of average YES price + average NO price after a contemplated buy (when both legs exist).
     pub sc_max_pair_cost: Decimal,
+    /// Prefer balanced inventory: do not buy YES if yes_qty > no_qty + this (and symmetric for NO).
+    pub sc_max_qty_imbalance: Decimal,
+    /// Max distinct market-rounds with spread-capture inventory at once (first-leg gate).
+    pub sc_max_active_markets: u32,
+    /// Shares per FAK tap (DCA size).
+    pub sc_fak_order_size: Decimal,
+    /// Minimum time between FAK orders on the same side (YES / NO).
+    pub sc_order_cooldown_ms: u64,
+    /// If true, spread capture runs only on 15m markets (5m left to sniper).
+    pub sc_prefer_15m: bool,
+    #[allow(dead_code)]
     pub sc_max_imbalance_pct: Decimal,
-    pub sc_min_price_dip: Decimal,
 
     // Momentum
     pub mom_min_spot_move_pct: Decimal,
@@ -25,10 +37,13 @@ pub struct Config {
     // Market Making
     pub mm_half_spread: Decimal,
     pub mm_volatility_spread: Decimal,
-    #[allow(dead_code)]
     pub mm_max_inventory_per_side: Decimal,
     pub mm_inventory_imbalance_limit: Decimal,
     pub mm_stop_before_end_secs: u64,
+    /// Rolling window of spot samples (loop ticks) for volatility spread widening.
+    pub mm_spot_volatility_window_ticks: usize,
+    /// If (max-min)/min of spot in the window >= this, use `mm_volatility_spread`.
+    pub mm_spot_move_pct_threshold: Decimal,
 
     // Sniper (legacy / momentum late entry)
     pub snipe_min_bid: Decimal,
@@ -40,6 +55,23 @@ pub struct Config {
     pub snipe_max_replacements: u32,
     #[allow(dead_code)]
     pub snipe_no_crossover_secs: u64,
+    /// Max shares per sniper leg (cap).
+    pub sniper_max_shares: Decimal,
+    /// Fraction of USDC balance to size each sniper entry (e.g. 0.01 = 1%).
+    pub sniper_capital_deploy_pct: Decimal,
+    /// Minimum shares per sniper order after sizing (floor then apply this floor).
+    pub sniper_min_shares: Decimal,
+    /// Minimum best_ask on a side before sniper may enter (event-driven threshold and entry gate).
+    pub sniper_entry_min_best_ask: Decimal,
+    /// Max confirmed primary sniper GTC fills per `(Period, round_start)` across all coins; then cancel rests.
+    pub sniper_max_fills_per_round: u32,
+    /// Single-leg sniper hedge: GTC on the other side one tick inside best ask when `fill_price + hedge_limit` ≤ this.
+    /// Set to `1.00` to disable (default active hedge uses `0.99`).
+    pub sniper_hedge_max_pair_cost: Decimal,
+    /// Seconds before round end when sniper may activate for rounds ≤ 5 minutes long (see [`Config::sniper_entry_window_secs`]).
+    pub sniper_entry_window_5m: u64,
+    /// Seconds before round end when sniper may activate for rounds longer than 5 minutes.
+    pub sniper_entry_window_15m: u64,
 
     // Risk
     #[allow(dead_code)]
@@ -122,22 +154,38 @@ impl Config {
             .unwrap_or_else(|_| "https://polygon-rpc.com".to_string());
 
         // Spread Capture (gabagool)
-        let sc_target_pair_cost = env::var("SC_TARGET_PAIR_COST")
-            .unwrap_or_else(|_| "0.97".to_string())
+        let sc_cheap_side_max_ask = env::var("SC_CHEAP_SIDE_MAX_ASK")
+            .unwrap_or_else(|_| "0.45".to_string())
             .parse::<Decimal>()
-            .context("SC_TARGET_PAIR_COST must be a decimal")?;
+            .context("SC_CHEAP_SIDE_MAX_ASK must be a decimal")?;
         let sc_max_pair_cost = env::var("SC_MAX_PAIR_COST")
-            .unwrap_or_else(|_| "0.99".to_string())
+            .unwrap_or_else(|_| "0.98".to_string())
             .parse::<Decimal>()
             .context("SC_MAX_PAIR_COST must be a decimal")?;
+        let sc_max_qty_imbalance = env::var("SC_MAX_QTY_IMBALANCE")
+            .unwrap_or_else(|_| "10".to_string())
+            .parse::<Decimal>()
+            .context("SC_MAX_QTY_IMBALANCE must be a decimal")?;
+        let sc_max_active_markets = env::var("SC_MAX_ACTIVE_MARKETS")
+            .unwrap_or_else(|_| "2".to_string())
+            .parse::<u32>()
+            .context("SC_MAX_ACTIVE_MARKETS must be a positive integer")?;
+        let sc_fak_order_size = env::var("SC_FAK_ORDER_SIZE")
+            .unwrap_or_else(|_| "5".to_string())
+            .parse::<Decimal>()
+            .context("SC_FAK_ORDER_SIZE must be a decimal")?;
+        let sc_order_cooldown_ms = env::var("SC_ORDER_COOLDOWN_MS")
+            .unwrap_or_else(|_| "500".to_string())
+            .parse::<u64>()
+            .context("SC_ORDER_COOLDOWN_MS must be a number")?;
+        let sc_prefer_15m = env::var("SC_PREFER_15M")
+            .unwrap_or_else(|_| "true".to_string())
+            .parse::<bool>()
+            .unwrap_or(true);
         let sc_max_imbalance_pct = env::var("SC_MAX_IMBALANCE_PCT")
             .unwrap_or_else(|_| "0.10".to_string())
             .parse::<Decimal>()
             .context("SC_MAX_IMBALANCE_PCT must be a decimal")?;
-        let sc_min_price_dip = env::var("SC_MIN_PRICE_DIP")
-            .unwrap_or_else(|_| "0.02".to_string())
-            .parse::<Decimal>()
-            .context("SC_MIN_PRICE_DIP must be a decimal")?;
 
         // Momentum
         let mom_min_spot_move_pct = env::var("MOM_MIN_SPOT_MOVE_PCT")
@@ -179,6 +227,16 @@ impl Config {
             .parse::<u64>()
             .context("MM_STOP_BEFORE_END_SECS must be a number")?;
 
+        let mm_spot_volatility_window_ticks = env::var("MM_SPOT_VOL_WINDOW_TICKS")
+            .unwrap_or_else(|_| "30".to_string())
+            .parse::<usize>()
+            .context("MM_SPOT_VOL_WINDOW_TICKS must be a number")?;
+
+        let mm_spot_move_pct_threshold = env::var("MM_SPOT_MOVE_PCT")
+            .unwrap_or_else(|_| "0.01".to_string())
+            .parse::<Decimal>()
+            .context("MM_SPOT_MOVE_PCT must be a decimal")?;
+
         // Sniper
         let snipe_min_bid = env::var("SNIPE_MIN_BID")
             .unwrap_or_else(|_| "0.90".to_string())
@@ -209,6 +267,46 @@ impl Config {
             .unwrap_or_else(|_| "45".to_string())
             .parse::<u64>()
             .context("SNIPE_NO_CROSSOVER_SECS must be a number")?;
+
+        let sniper_max_shares = env::var("SNIPER_MAX_SHARES")
+            .unwrap_or_else(|_| "10".to_string())
+            .parse::<Decimal>()
+            .context("SNIPER_MAX_SHARES must be a decimal")?;
+
+        let sniper_capital_deploy_pct = env::var("SNIPER_CAPITAL_DEPLOY_PCT")
+            .unwrap_or_else(|_| "0.01".to_string())
+            .parse::<Decimal>()
+            .context("SNIPER_CAPITAL_DEPLOY_PCT must be a decimal")?;
+
+        let sniper_min_shares = env::var("SNIPER_MIN_SHARES")
+            .unwrap_or_else(|_| "3".to_string())
+            .parse::<Decimal>()
+            .context("SNIPER_MIN_SHARES must be a decimal")?;
+
+        let sniper_entry_min_best_ask = env::var("SNIPER_ENTRY_MIN_BEST_ASK")
+            .unwrap_or_else(|_| "0.96".to_string())
+            .parse::<Decimal>()
+            .context("SNIPER_ENTRY_MIN_BEST_ASK must be a decimal")?;
+
+        let sniper_max_fills_per_round = env::var("SNIPER_MAX_FILLS_PER_ROUND")
+            .unwrap_or_else(|_| "2".to_string())
+            .parse::<u32>()
+            .context("SNIPER_MAX_FILLS_PER_ROUND must be a positive integer")?;
+
+        let sniper_hedge_max_pair_cost = env::var("SNIPER_HEDGE_MAX_PAIR_COST")
+            .unwrap_or_else(|_| "0.99".to_string())
+            .parse::<Decimal>()
+            .context("SNIPER_HEDGE_MAX_PAIR_COST must be a decimal")?;
+
+        let sniper_entry_window_5m = env::var("SNIPER_ENTRY_WINDOW_5M")
+            .unwrap_or_else(|_| "60".to_string())
+            .parse::<u64>()
+            .context("SNIPER_ENTRY_WINDOW_5M must be a positive integer (seconds)")?;
+
+        let sniper_entry_window_15m = env::var("SNIPER_ENTRY_WINDOW_15M")
+            .unwrap_or_else(|_| "180".to_string())
+            .parse::<u64>()
+            .context("SNIPER_ENTRY_WINDOW_15M must be a positive integer (seconds)")?;
 
         // Risk
         let max_concurrent_rounds = env::var("MAX_CONCURRENT_ROUNDS")
@@ -279,7 +377,8 @@ impl Config {
 
         // Logging
         let rust_log = env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
-        let log_file = env::var("LOG_FILE").unwrap_or_else(|_| "polymarket-bot.log".to_string());
+        // Rolling log filename prefix under ./logs/ (see main.rs tracing init).
+        let log_file = env::var("LOG_FILE").unwrap_or_else(|_| "bot.log".to_string());
 
         // Strategy Mode (default to sniper_only)
         let strategy_mode_str = env::var("STRATEGY_MODE")
@@ -298,10 +397,14 @@ impl Config {
             signature_type,
             funder_address,
             polygon_rpc_url,
-            sc_target_pair_cost,
+            sc_cheap_side_max_ask,
             sc_max_pair_cost,
+            sc_max_qty_imbalance,
+            sc_max_active_markets,
+            sc_fak_order_size,
+            sc_order_cooldown_ms,
+            sc_prefer_15m,
             sc_max_imbalance_pct,
-            sc_min_price_dip,
             mom_min_spot_move_pct,
             mom_late_entry_min_bid,
             mom_preemptive_cancel_ms,
@@ -310,12 +413,22 @@ impl Config {
             mm_max_inventory_per_side,
             mm_inventory_imbalance_limit,
             mm_stop_before_end_secs,
+            mm_spot_volatility_window_ticks,
+            mm_spot_move_pct_threshold,
             snipe_min_bid,
             snipe_max_spread,
             snipe_min_elapsed_pct,
             snipe_position_size_pct,
             snipe_max_replacements,
             snipe_no_crossover_secs,
+            sniper_max_shares,
+            sniper_capital_deploy_pct,
+            sniper_min_shares,
+            sniper_entry_min_best_ask,
+            sniper_max_fills_per_round,
+            sniper_hedge_max_pair_cost,
+            sniper_entry_window_5m,
+            sniper_entry_window_15m,
             max_concurrent_rounds,
             daily_loss_limit_pct,
             circuit_breaker_consecutive_losses,
@@ -332,5 +445,17 @@ impl Config {
             strategy_mode,
             dry_run,
         })
+    }
+
+    /// Seconds before round end when the sniper may start evaluating entries (still subject to
+    /// `sniper_entry_min_best_ask` and other gates). Uses the 5m window when the round length is
+    /// at most 5 minutes; otherwise uses the 15m (long-round) window.
+    pub fn sniper_entry_window_secs(&self, round_duration_secs: i64) -> u64 {
+        const FIVE_MIN_SECS: i64 = 5 * 60;
+        if round_duration_secs <= FIVE_MIN_SECS {
+            self.sniper_entry_window_5m
+        } else {
+            self.sniper_entry_window_15m
+        }
     }
 }

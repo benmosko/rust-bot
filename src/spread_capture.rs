@@ -1,19 +1,34 @@
-//! Strategy 1: Spread Capture / Dual-Side Arbitrage (gabagool strategy).
-//! Buy YES when YES dips, NO when NO dips; keep pair cost < target; balance quantities.
+//! Strategy 1: Spread Capture — gabagool DCA via **FAK** limit orders at the best ask.
+//!
+//! Uses the SDK `limit_order()` builder (not `market_order()`). For limit orders, BUY `size` is
+//! **shares** (USDC notional is `size * price`). The market-order builder is different: BUY may use
+//! USDC notional or shares via `Amount::usdc` / `Amount::shares`.
+//! Small repeated fills; no resting-order polling.
 
 use crate::config::Config;
 use crate::execution::ExecutionEngine;
 use crate::orderbook::OrderbookManager;
-use crate::types::{Market, PairCost, strategy_status_key};
+use crate::pnl::PnLManager;
+use crate::types::{FilledTrade, Market, TuiEvent, strategy_status_key};
 use anyhow::Result;
-use chrono::Utc;
-use dashmap::DashMap;
+use chrono::{Local, Utc};
+use dashmap::{DashMap, DashSet};
+use polymarket_client_sdk::clob::types::{OrderType, Side};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::sync::Arc;
-use tokio::time::{sleep, Duration};
+
+/// Polymarket rejects FAK BUY when `shares × price` is below this USDC notional.
+const FAK_MIN_DOLLAR_AMOUNT: Decimal = Decimal::ONE;
+use std::time::Instant;
+use tokio::sync::{broadcast::error::RecvError, mpsc, watch};
+use tokio::time::{Duration as TokioDuration, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{error, info, warn};
+
+fn gab_fmt_d4(d: Decimal) -> String {
+    d.round_dp(4).normalize().to_string()
+}
 
 pub struct SpreadCapture {
     market: Market,
@@ -21,12 +36,17 @@ pub struct SpreadCapture {
     execution: Arc<ExecutionEngine>,
     orderbook: Arc<OrderbookManager>,
     strategy_status: Arc<DashMap<String, String>>,
+    balance_receiver: watch::Receiver<Decimal>,
+    pnl_manager: Arc<PnLManager>,
+    trade_history: Arc<DashMap<String, FilledTrade>>,
+    tui_tx: Option<mpsc::Sender<TuiEvent>>,
     yes_qty: Decimal,
     yes_cost: Decimal,
     no_qty: Decimal,
     no_cost: Decimal,
-    last_yes_bid: Decimal,
-    last_no_bid: Decimal,
+    active_markets: Arc<DashSet<String>>,
+    last_yes_fak: Option<Instant>,
+    last_no_fak: Option<Instant>,
 }
 
 impl SpreadCapture {
@@ -36,6 +56,11 @@ impl SpreadCapture {
         execution: Arc<ExecutionEngine>,
         orderbook: Arc<OrderbookManager>,
         strategy_status: Arc<DashMap<String, String>>,
+        balance_receiver: watch::Receiver<Decimal>,
+        pnl_manager: Arc<PnLManager>,
+        trade_history: Arc<DashMap<String, FilledTrade>>,
+        tui_tx: Option<mpsc::Sender<TuiEvent>>,
+        active_markets: Arc<DashSet<String>>,
     ) -> Self {
         let status_key = strategy_status_key(market.coin, market.period, market.round_start, "spread_capture");
         strategy_status.insert(status_key.clone(), "Watching".to_string());
@@ -45,188 +70,420 @@ impl SpreadCapture {
             execution,
             orderbook,
             strategy_status,
+            balance_receiver,
+            pnl_manager,
+            trade_history,
+            tui_tx,
             yes_qty: dec!(0),
             yes_cost: dec!(0),
             no_qty: dec!(0),
             no_cost: dec!(0),
-            last_yes_bid: dec!(0),
-            last_no_bid: dec!(0),
+            active_markets,
+            last_yes_fak: None,
+            last_no_fak: None,
         }
     }
 
-    fn current_pair_cost(&self) -> PairCost {
-        PairCost::new(self.yes_qty, self.yes_cost, self.no_qty, self.no_cost)
+    fn active_market_key(&self) -> String {
+        format!("{}:{}", self.market.slug, self.market.round_start)
     }
 
-    /// Simulate pair cost if we add a buy: (yes_cost + no_cost + price * size) / min(new_yes_qty, new_no_qty).
-    fn simulated_pair_cost_after_buy_yes(&self, price: Decimal, size: Decimal) -> Decimal {
-        let new_yes_qty = self.yes_qty + size;
-        let new_yes_cost = self.yes_cost + price * size;
-        let min_qty = new_yes_qty.min(self.no_qty);
-        if min_qty <= dec!(0) {
-            return dec!(1.0);
+    fn unregister_active_market(&self) {
+        self.active_markets.remove(&self.active_market_key());
+    }
+
+    fn avg_sum_pair_cost(&self) -> Option<Decimal> {
+        if self.yes_qty > Decimal::ZERO && self.no_qty > Decimal::ZERO {
+            Some(self.yes_cost / self.yes_qty + self.no_cost / self.no_qty)
+        } else {
+            None
         }
-        (new_yes_cost + self.no_cost) / min_qty
     }
 
-    fn simulated_pair_cost_after_buy_no(&self, price: Decimal, size: Decimal) -> Decimal {
-        let new_no_qty = self.no_qty + size;
-        let new_no_cost = self.no_cost + price * size;
-        let min_qty = self.yes_qty.min(new_no_qty);
-        if min_qty <= dec!(0) {
-            return dec!(1.0);
+    fn simulated_pair_after_yes_buy(&self, ask: Decimal, shares: Decimal) -> Option<Decimal> {
+        if self.no_qty.is_zero() {
+            return None;
         }
-        (self.yes_cost + new_no_cost) / min_qty
+        let nq = self.yes_qty + shares;
+        let nc = self.yes_cost + ask * shares;
+        let nya = nc / nq;
+        let noa = self.no_cost / self.no_qty;
+        Some(nya + noa)
     }
 
-    fn imbalance_pct(&self) -> Decimal {
-        let max_qty = self.yes_qty.max(self.no_qty);
-        if max_qty <= dec!(0) {
-            return Decimal::ZERO;
+    fn simulated_pair_after_no_buy(&self, ask: Decimal, shares: Decimal) -> Option<Decimal> {
+        if self.yes_qty.is_zero() {
+            return None;
         }
-        (self.yes_qty - self.no_qty).abs() / max_qty
+        let nq = self.no_qty + shares;
+        let nc = self.no_cost + ask * shares;
+        let nna = nc / nq;
+        let yav = self.yes_cost / self.yes_qty;
+        Some(yav + nna)
     }
 
-    pub async fn run(
+    fn record_buy_fill(
         &mut self,
-        shutdown: CancellationToken,
-    ) -> Result<()> {
+        is_yes: bool,
+        shares: Decimal,
+        usdc_spent: Decimal,
+        status_key: &str,
+        order_id: &str,
+        limit_price: Decimal,
+    ) {
+        if shares <= Decimal::ZERO {
+            return;
+        }
+
+        if is_yes {
+            self.yes_qty += shares;
+            self.yes_cost += usdc_spent;
+        } else {
+            self.no_qty += shares;
+            self.no_cost += usdc_spent;
+        }
+
+        let side_name = if is_yes { "YES" } else { "NO" };
+        self.pnl_manager.on_fill(
+            self.market.slug.clone(),
+            self.market.condition_id.clone(),
+            side_name.to_string(),
+            limit_price,
+            shares,
+        );
+
+        let side_display = if is_yes { "UP" } else { "DOWN" };
+        let fill_time = Local::now().format("%H:%M:%S").to_string();
+        let log_msg = format!(
+            "{} {} {} {} {}@{} FAK (+{} sh, ${} USDC)",
+            fill_time,
+            self.market.coin.as_str(),
+            format!("{}m", self.market.period.as_minutes()),
+            side_display,
+            shares,
+            limit_price,
+            shares,
+            usdc_spent
+        );
+        if let Some(ref tx) = self.tui_tx {
+            let _ = tx.try_send(TuiEvent::TradeLog(log_msg));
+        }
+
+        self.trade_history.insert(
+            order_id.to_string(),
+            FilledTrade {
+                slug: self.market.slug.clone(),
+                side: side_name.to_string(),
+                price: limit_price,
+                size_matched: shares,
+                condition_id: self.market.condition_id.clone(),
+                timestamp: Utc::now(),
+            },
+        );
+
+        let _ = self.active_markets.insert(self.active_market_key());
+
+        let status_line = if let Some(pc) = self.avg_sum_pair_cost() {
+            format!("pair_avg ${:.3}", pc)
+        } else {
+            format!(
+                "Y {:.2} / N {:.2}",
+                self.yes_qty.round_dp(2),
+                self.no_qty.round_dp(2)
+            )
+        };
+        self.strategy_status.insert(status_key.to_string(), status_line);
+    }
+
+    fn cooldown_ok(&self, is_yes: bool) -> bool {
+        let cd = std::time::Duration::from_millis(self.config.sc_order_cooldown_ms);
+        let last = if is_yes {
+            self.last_yes_fak
+        } else {
+            self.last_no_fak
+        };
+        last.map(|t| t.elapsed() >= cd).unwrap_or(true)
+    }
+
+    fn mark_fak_sent(&mut self, is_yes: bool) {
+        let now = Instant::now();
+        if is_yes {
+            self.last_yes_fak = Some(now);
+        } else {
+            self.last_no_fak = Some(now);
+        }
+    }
+
+    async fn try_fak_buy(
+        &mut self,
+        is_yes: bool,
+        status_key: &str,
+        tick: Decimal,
+    ) {
+        if !self.cooldown_ok(is_yes) {
+            return;
+        }
+
+        let ask = if is_yes {
+            self.orderbook
+                .get_orderbook(&self.market.up_token_id)
+                .and_then(|o| o.best_ask())
+        } else {
+            self.orderbook
+                .get_orderbook(&self.market.down_token_id)
+                .and_then(|o| o.best_ask())
+        };
+        let Some(ask) = ask.filter(|a| !a.is_zero()) else {
+            return;
+        };
+
+        if ask > self.config.sc_cheap_side_max_ask {
+            return;
+        }
+
+        let tol = self.config.sc_max_qty_imbalance;
+        if is_yes && self.yes_qty > self.no_qty + tol {
+            return;
+        }
+        if !is_yes && self.no_qty > self.yes_qty + tol {
+            return;
+        }
+
+        let min_shares_for_dollar_floor = (FAK_MIN_DOLLAR_AMOUNT / ask).ceil().round_dp(2);
+        let shares = self
+            .config
+            .sc_fak_order_size
+            .max(dec!(0.01))
+            .max(min_shares_for_dollar_floor)
+            .round_dp(2);
+        let est_cost = (shares * ask).round_dp(2);
+
+        let flat = self.yes_qty.is_zero() && self.no_qty.is_zero();
+        if flat {
+            let key = self.active_market_key();
+            if !self.active_markets.contains(&key) {
+                let n = self.active_markets.len();
+                let max = self.config.sc_max_active_markets as usize;
+                if n >= max {
+                    self.strategy_status
+                        .insert(status_key.to_string(), "Waiting (active cap)".to_string());
+                    return;
+                }
+            }
+        }
+
+        let balance = *self.balance_receiver.borrow();
+        if est_cost > balance {
+            self.strategy_status
+                .insert(status_key.to_string(), "Low balance".to_string());
+            return;
+        }
+
+        if let Some(np) = if is_yes {
+            self.simulated_pair_after_yes_buy(ask, shares)
+        } else {
+            self.simulated_pair_after_no_buy(ask, shares)
+        } {
+            if np > self.config.sc_max_pair_cost {
+                return;
+            }
+        }
+
+        let token_id = if is_yes {
+            self.market.up_token_id.clone()
+        } else {
+            self.market.down_token_id.clone()
+        };
+
+        self.strategy_status.insert(
+            status_key.to_string(),
+            format!(
+                "FAK {} {}sh @{}",
+                if is_yes { "YES" } else { "NO" },
+                shares,
+                gab_fmt_d4(ask)
+            ),
+        );
+
+        self.mark_fak_sent(is_yes);
+
+        let resp = match self
+            .execution
+            .place_limit_order(
+                token_id.as_str(),
+                Side::Buy,
+                ask,
+                shares,
+                tick,
+                OrderType::FAK,
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                error!(
+                    detail = %crate::execution::format_order_error_for_logs(&e),
+                    "Gab: FAK order details — token_id={}, side={:?}, price={}, size={}, order_type={:?}, error={:?}",
+                    token_id.as_str(),
+                    Side::Buy,
+                    ask,
+                    shares,
+                    OrderType::FAK,
+                    e,
+                );
+                self.strategy_status
+                    .insert(status_key.to_string(), "Order failed".to_string());
+                warn!(market = %self.market.slug, error = %e, "Gab: FAK order failed");
+                return;
+            }
+        };
+
+        if !resp.success {
+            error!(
+                market = %self.market.slug,
+                token_id = %token_id,
+                side = ?Side::Buy,
+                price = %ask,
+                size = %shares,
+                order_type = ?OrderType::FAK,
+                resp = ?resp,
+                err_msg = ?resp.error_msg,
+                "Gab: FAK post rejected (HTTP OK, success=false) — full PostOrderResponse above"
+            );
+            warn!(
+                market = %self.market.slug,
+                err = ?resp.error_msg,
+                "Gab: FAK post rejected"
+            );
+            return;
+        }
+
+        // BUY: taking_amount = shares filled, making_amount = USDC spent (per CLOB response).
+        let filled_shares = resp.taking_amount;
+        let usdc = resp.making_amount;
+        if filled_shares > Decimal::ZERO {
+            self.record_buy_fill(
+                is_yes,
+                filled_shares,
+                usdc,
+                status_key,
+                &resp.order_id,
+                ask,
+            );
+            info!(
+                "Gab {}: FAK BUY {} — filled {} sh, ${} USDC, order_id={}",
+                self.market.slug,
+                if is_yes { "YES" } else { "NO" },
+                filled_shares,
+                usdc,
+                resp.order_id
+            );
+        }
+    }
+
+    pub async fn run(&mut self, shutdown: CancellationToken) -> Result<()> {
         info!(
             market = %self.market.slug,
             round_start = self.market.round_start,
-            "Spread capture (gabagool) started"
+            "Spread capture (gabagool FAK DCA) started"
+        );
+        info!(
+            "Gab config: cheap_ask<={}, pair_max={}, imbalance<={}, fak_shares={}, cooldown_ms={}, max_active_markets={}",
+            self.config.sc_cheap_side_max_ask,
+            self.config.sc_max_pair_cost,
+            self.config.sc_max_qty_imbalance,
+            self.config.sc_fak_order_size,
+            self.config.sc_order_cooldown_ms,
+            self.config.sc_max_active_markets,
         );
 
-        let status_key = strategy_status_key(self.market.coin, self.market.period, self.market.round_start, "spread_capture");
-        let order_size = self.market.minimum_order_size.round_dp(2); // Round size to 2 decimal places
+        let status_key = strategy_status_key(
+            self.market.coin,
+            self.market.period,
+            self.market.round_start,
+            "spread_capture",
+        );
         let tick = self.market.minimum_tick_size;
 
-        while !shutdown.is_cancelled() {
+        let mut book_rx = self.orderbook.subscribe_book_updates();
+        let mut fast_tick = tokio::time::interval(TokioDuration::from_millis(2));
+        fast_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        loop {
+            if shutdown.is_cancelled() {
+                info!(market = %self.market.slug, "Spread capture shutting down");
+                self.unregister_active_market();
+                return Ok(());
+            }
+
             let now = Utc::now().timestamp();
             if now >= self.market.round_end {
                 info!(market = %self.market.slug, "Round ended, spread capture exit");
-                self.strategy_status.insert(status_key.clone(), "Ended".to_string());
+
+                if self.yes_qty > Decimal::ZERO && self.no_qty > Decimal::ZERO {
+                    let yes_avg = self.yes_cost / self.yes_qty;
+                    let no_avg = self.no_cost / self.no_qty;
+                    let pair_avg = yes_avg + no_avg;
+                    let profit_per_share = Decimal::ONE - pair_avg;
+                    let hedged_qty = self.yes_qty.min(self.no_qty);
+                    let excess_yes = (self.yes_qty - self.no_qty).max(Decimal::ZERO);
+                    let excess_no = (self.no_qty - self.yes_qty).max(Decimal::ZERO);
+                    info!(
+                        "Gab {}: round summary — yes_avg={} no_avg={} pair_avg_sum={} profit/share≈{} hedged_qty={} excess_yes={} excess_no={}",
+                        self.market.slug,
+                        gab_fmt_d4(yes_avg),
+                        gab_fmt_d4(no_avg),
+                        gab_fmt_d4(pair_avg),
+                        gab_fmt_d4(profit_per_share),
+                        hedged_qty,
+                        excess_yes,
+                        excess_no,
+                    );
+                } else if self.yes_qty > Decimal::ZERO || self.no_qty > Decimal::ZERO {
+                    info!(
+                        "Gab {}: round ended with incomplete pair — directional exposure (yes_qty={}, no_qty={})",
+                        self.market.slug,
+                        self.yes_qty,
+                        self.no_qty,
+                    );
+                } else {
+                    info!("Gab {}: round ended flat (no inventory)", self.market.slug);
+                }
+
+                self.strategy_status
+                    .insert(status_key.clone(), "Ended".to_string());
+                self.unregister_active_market();
                 break;
             }
 
-            let yes_ob = self.orderbook.get_orderbook(&self.market.up_token_id);
-            let no_ob = self.orderbook.get_orderbook(&self.market.down_token_id);
-
-            let (yes_bid, no_bid) = match (yes_ob.and_then(|o| o.best_bid()), no_ob.and_then(|o| o.best_bid())) {
-                (Some(y), Some(n)) => (y, n),
-                _ => {
-                    self.strategy_status.insert(status_key.clone(), "Waiting for price".to_string());
-                    sleep(Duration::from_millis(500)).await;
-                    continue;
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => {
+                    self.unregister_active_market();
+                    return Ok(());
                 }
-            };
-
-            // Guard against zero prices
-            if yes_bid.is_zero() || no_bid.is_zero() {
-                self.strategy_status.insert(status_key.clone(), "Waiting for price".to_string());
-                sleep(Duration::from_millis(500)).await;
-                continue;
-            }
-
-            let _pair = self.current_pair_cost();
-            let imbalance = self.imbalance_pct();
-
-            // Only buy YES if: YES price dipped, adding YES keeps pair cost < max, and we're not over-weighted YES.
-            let yes_dipped = self.last_yes_bid > dec!(0) && yes_bid <= self.last_yes_bid - self.config.sc_min_price_dip
-                || self.last_yes_bid == dec!(0);
-            let buy_yes_ok = imbalance <= self.config.sc_max_imbalance_pct
-                || self.no_qty > self.yes_qty;
-            let new_pair_yes = self.simulated_pair_cost_after_buy_yes(yes_bid + tick, order_size);
-            if yes_dipped && buy_yes_ok && new_pair_yes < self.config.sc_max_pair_cost && new_pair_yes <= self.config.sc_target_pair_cost + dec!(0.01) {
-                self.strategy_status.insert(status_key.clone(), "Entry signal: YES".to_string());
-                match self
-                    .execution
-                    .place_order(
-                        &self.market.up_token_id,
-                        polymarket_client_sdk::clob::types::Side::Buy,
-                        yes_bid + tick,
-                        order_size,
-                        tick,
-                    )
-                    .await
-                {
-                    Ok(_) => {
-                        self.yes_qty += order_size;
-                        self.yes_cost += (yes_bid + tick) * order_size;
-                        let pair_cost = self.current_pair_cost().pair_cost;
-                        self.strategy_status.insert(status_key.clone(), format!("Gabagool: pair ${:.3}", pair_cost));
-                        debug!(
-                            market = %self.market.slug,
-                            yes_qty = %self.yes_qty,
-                            pair_cost = %pair_cost,
-                            "Bought YES"
-                        );
-                    }
-                    Err(e) => {
-                        self.strategy_status.insert(status_key.clone(), "Order failed".to_string());
-                        warn!(market = %self.market.slug, error = %e, "Spread capture: YES order failed");
+                r = book_rx.recv() => {
+                    match r {
+                        Ok(_token_id) => {}
+                        Err(RecvError::Lagged(_)) => {}
+                        Err(RecvError::Closed) => {
+                            self.unregister_active_market();
+                            return Ok(());
+                        }
                     }
                 }
+                _ = fast_tick.tick() => {}
             }
 
-            // Only buy NO if: NO price dipped, adding NO keeps pair cost < max, and we're not over-weighted NO.
-            let no_dipped = self.last_no_bid > dec!(0) && no_bid <= self.last_no_bid - self.config.sc_min_price_dip
-                || self.last_no_bid == dec!(0);
-            let buy_no_ok = imbalance <= self.config.sc_max_imbalance_pct
-                || self.yes_qty > self.no_qty;
-            let new_pair_no = self.simulated_pair_cost_after_buy_no(no_bid + tick, order_size);
-            if no_dipped && buy_no_ok && new_pair_no < self.config.sc_max_pair_cost && new_pair_no <= self.config.sc_target_pair_cost + dec!(0.01) {
-                self.strategy_status.insert(status_key.clone(), "Entry signal: NO".to_string());
-                match self
-                    .execution
-                    .place_order(
-                        &self.market.down_token_id,
-                        polymarket_client_sdk::clob::types::Side::Buy,
-                        no_bid + tick,
-                        order_size,
-                        tick,
-                    )
-                    .await
-                {
-                    Ok(_) => {
-                        self.no_qty += order_size;
-                        self.no_cost += (no_bid + tick) * order_size;
-                        let pair_cost = self.current_pair_cost().pair_cost;
-                        self.strategy_status.insert(status_key.clone(), format!("Gabagool: pair ${:.3}", pair_cost));
-                        debug!(
-                            market = %self.market.slug,
-                            no_qty = %self.no_qty,
-                            pair_cost = %pair_cost,
-                            "Bought NO"
-                        );
-                    }
-                    Err(e) => {
-                        self.strategy_status.insert(status_key.clone(), "Order failed".to_string());
-                        warn!(market = %self.market.slug, error = %e, "Spread capture: NO order failed");
-                    }
-                }
+            // Prefer the side with fewer shares first.
+            let yes_first = self.yes_qty <= self.no_qty;
+            if yes_first {
+                self.try_fak_buy(true, &status_key, tick).await;
+                self.try_fak_buy(false, &status_key, tick).await;
+            } else {
+                self.try_fak_buy(false, &status_key, tick).await;
+                self.try_fak_buy(true, &status_key, tick).await;
             }
-            
-            // Update status if watching
-            if self.yes_qty.is_zero() && self.no_qty.is_zero() {
-                self.strategy_status.insert(status_key.clone(), "Watching".to_string());
-            }
-
-            self.last_yes_bid = yes_bid;
-            self.last_no_bid = no_bid;
-
-            let pair_after = self.current_pair_cost();
-            if pair_after.pair_cost > dec!(0) && (pair_after.yes_qty > dec!(0) || pair_after.no_qty > dec!(0)) {
-                info!(
-                    market = %self.market.slug,
-                    pair_cost = %pair_after.pair_cost,
-                    yes_qty = %pair_after.yes_qty,
-                    no_qty = %pair_after.no_qty,
-                    "Spread capture pair cost"
-                );
-            }
-
-            sleep(Duration::from_millis(500)).await;
         }
 
         Ok(())

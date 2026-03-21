@@ -1,0 +1,19 @@
+[Unit]
+Description=Polymarket trading bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/polymarket-bot
+EnvironmentFile=-/home/ubuntu/polymarket-bot/.env
+ExecStart=/home/ubuntu/polymarket-bot/target/release/polymarket-bot
+Restart=on-failure
+RestartSec=5
+# Logs go to logs/ per app config; journal still captures crashes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
