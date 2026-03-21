@@ -27,7 +27,8 @@ fn format_duration_hms(d: Duration) -> String {
 use chrono::{DateTime, Local};
 use polymarket_bot::balance::fetch_usdc_balance;
 use polymarket_bot::telegram::{
-    query_latest_session_id, query_session_pnl, query_session_stats, SessionStatsSnapshot,
+    query_session_pnl, query_session_stats, resolve_session_id_for_supervisor,
+    webapp_dashboard_url_from_env, SessionStatsSnapshot,
 };
 use polymarket_client_sdk::types::Address;
 use reqwest::Client;
@@ -38,6 +39,17 @@ use tokio::time::sleep;
 
 /// `/balance` command: fixed proxy wallet from project docs (same as `telegram.rs`).
 const BALANCE_PROXY_WALLET: &str = "0xD6d35B777089235c9CCDcD4830BF1BBda2A06300";
+
+/// Inline WebApp button for the same Mini App URL `polymarket-bot` uses on startup (if env is set).
+fn telegram_webapp_dashboard_markup() -> Option<serde_json::Value> {
+    let url = webapp_dashboard_url_from_env()?;
+    Some(serde_json::json!({
+        "inline_keyboard": [[{
+            "text": "📊 Live dashboard",
+            "web_app": { "url": url }
+        }]]
+    }))
+}
 
 fn default_polybot_binary() -> String {
     let candidates: &[&str] = if cfg!(target_os = "windows") {
@@ -184,15 +196,72 @@ impl Supervisor {
         }
     }
 
-    async fn send_message_with_retry(&self, text: &str) {
+    /// Clear webhook so `getUpdates` long polling works (Telegram rejects polling if a webhook is set).
+    async fn telegram_delete_webhook(&self) {
+        let url = format!(
+            "https://api.telegram.org/bot{}/deleteWebhook",
+            self.token
+        );
+        let body = serde_json::json!({ "drop_pending_updates": false });
+        match self.client.post(&url).json(&body).send().await {
+            Ok(r) if r.status().is_success() => {}
+            Ok(r) => {
+                let status = r.status();
+                let body = r.text().await.unwrap_or_default();
+                eprintln!(
+                    "supervisor: deleteWebhook HTTP {} — {}",
+                    status,
+                    body.chars().take(300).collect::<String>()
+                );
+            }
+            Err(e) => eprintln!("supervisor: deleteWebhook error: {}", e),
+        }
+    }
+
+    /// Log webhook URL (if any) for debugging 409 / polling conflicts.
+    async fn telegram_log_webhook_info(&self) {
+        let url = format!(
+            "https://api.telegram.org/bot{}/getWebhookInfo",
+            self.token
+        );
+        match self.client.get(&url).send().await {
+            Ok(r) => {
+                if let Ok(text) = r.text().await {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                        let wurl = v
+                            .get("result")
+                            .and_then(|x| x.get("url"))
+                            .and_then(|u| u.as_str())
+                            .unwrap_or("");
+                        if wurl.is_empty() {
+                            eprintln!("supervisor: getWebhookInfo: no webhook URL (OK for long polling)");
+                        } else {
+                            eprintln!(
+                                "supervisor: getWebhookInfo: webhook URL is set — {}",
+                                wurl
+                            );
+                        }
+                    } else {
+                        eprintln!("supervisor: getWebhookInfo: {}", text.chars().take(200).collect::<String>());
+                    }
+                }
+            }
+            Err(e) => eprintln!("supervisor: getWebhookInfo error: {}", e),
+        }
+    }
+
+    async fn send_message_with_retry(&self, text: &str, reply_markup: Option<serde_json::Value>) {
         let url = format!("https://api.telegram.org/bot{}/sendMessage", self.token);
         let mut backoff_ms: u64 = 1000;
         loop {
-            let body = serde_json::json!({
+            let mut body = serde_json::json!({
                 "chat_id": self.chat_id,
                 "text": text,
                 "parse_mode": "HTML",
             });
+            if let Some(ref m) = reply_markup {
+                body["reply_markup"] = m.clone();
+            }
             match self.client.post(&url).json(&body).send().await {
                 Ok(resp) => {
                     if resp.status().is_success() {
@@ -294,10 +363,10 @@ impl Supervisor {
                     self.bot_process = None;
                     self.tracked_bot_pid = None;
                     let code = status.code();
-                    self.send_message_with_retry(&format!(
-                        "⚠️ Bot exited unexpectedly (exit code: {:?})",
-                        code
-                    ))
+                    self.send_message_with_retry(
+                        &format!("⚠️ Bot exited unexpectedly (exit code: {:?})", code),
+                        None,
+                    )
                     .await;
                 }
                 Ok(None) => {}
@@ -328,7 +397,7 @@ impl Supervisor {
         if !Path::new(path).exists() {
             return "No trading data yet.".to_string();
         }
-        let sid = match query_latest_session_id(path) {
+        let sid = match resolve_session_id_for_supervisor(path, "logs") {
             Ok(Some(s)) => s,
             Ok(None) => return "No trading data yet.".to_string(),
             Err(e) => return format!("DB error: {}", e),
@@ -336,11 +405,15 @@ impl Supervisor {
         match query_session_pnl(path, &sid) {
             Ok((sum, n)) => {
                 if n == 0 {
-                    return "No trading data yet.".to_string();
+                    return format!(
+                        "📊 Session P&L ({})\n+$0.0000 (0 trades — no resolutions logged yet)",
+                        sid
+                    );
                 }
                 let sign = if sum >= 0.0 { "+" } else { "-" };
                 format!(
-                    "📊 Session P&L: {}${:.4} ({} trades)",
+                    "📊 Session P&L ({})\n{}${:.4} ({} trades)",
+                    sid,
                     sign,
                     sum.abs(),
                     n
@@ -355,18 +428,18 @@ impl Supervisor {
         if !Path::new(path).exists() {
             return "No trading data yet.".to_string();
         }
-        let sid = match query_latest_session_id(path) {
+        let sid = match resolve_session_id_for_supervisor(path, "logs") {
             Ok(Some(s)) => s,
             Ok(None) => return "No trading data yet.".to_string(),
             Err(e) => return format!("DB error: {}", e),
         };
         match query_session_stats(path, &sid) {
-            Ok(s) => Self::format_stats_card(&s),
+            Ok(s) => Self::format_stats_card(&sid, &s),
             Err(e) => format!("DB error: {}", e),
         }
     }
 
-    fn format_stats_card(s: &SessionStatsSnapshot) -> String {
+    fn format_stats_card(session_id: &str, s: &SessionStatsSnapshot) -> String {
         let wr = if s.won + s.lost > 0 {
             (s.won as f64 / (s.won + s.lost) as f64) * 100.0
         } else {
@@ -374,10 +447,13 @@ impl Supervisor {
         };
         let pnl_sign = if s.total_pnl >= 0.0 { "+" } else { "-" };
         format!(
-            "📈 Session Stats\n\
+            "📈 Session Stats — {}\n\
              WON: {} | LOST: {} | HEDGED: {} | TIE: {}\n\
              Win Rate: {:.1}%\n\
-             Total P&L: {}${:.2}",
+             Total P&L: {}${:.2}\n\
+             \n\
+             (Session id: newest `logs/polymarket-bot.<session>.log` by mtime; if none, latest round row in DB.)",
+            session_id,
             s.won,
             s.lost,
             s.hedged,
@@ -399,7 +475,7 @@ impl Supervisor {
             "🔴 Bot is not running".to_string()
         };
         let stats = self.latest_session_stats_line();
-        format!(
+        let base = format!(
             "📊 Polybot Dashboard (supervisor)\n\
              ━━━━━━━━━━━━━━━━━━━━\n\
              \n\
@@ -408,14 +484,25 @@ impl Supervisor {
              \n\
              {}\n\
              \n\
-             📍 Open positions: available when the trading bot is running.\n\
+             📍 Open positions: live list is in the Mini App (⏱) when the bot is running.\n\
              \n\
              Latest log: {}",
             balance_line,
             bot_line,
             stats,
             last_log_activity_line("logs")
-        )
+        );
+        if webapp_dashboard_url_from_env().is_some() {
+            format!(
+                "{}\n\n👇 Use the <b>Live dashboard</b> button below for the HTML Mini App.",
+                base
+            )
+        } else {
+            format!(
+                "{}\n\n<i>No Mini App URL: set TELEGRAM_WEBAPP_PUBLIC_URL in .env (e.g. ngrok) and restart the bot — same as for startup keyboard buttons.</i>",
+                base
+            )
+        }
     }
 
     async fn handle_command(&mut self, text: &str) -> String {
@@ -445,13 +532,13 @@ impl Supervisor {
              /restart — stop then start\n\
              /status — bot PID / uptime + latest log mtime\n\
              /balance — on-chain USDC (proxy wallet)\n\
-             /pnl — latest session P&L from {}\n\
-             /stats — latest session stats from DB\n\
-             /dashboard — balance + bot status + DB stats\n\
+             /pnl — latest session P&L from {} (session id shown)\n\
+             /stats — latest session stats from DB (session id + note)\n\
+             /dashboard — balance + bot status + DB stats + Live dashboard button if TELEGRAM_WEBAPP_PUBLIC_URL is set\n\
              /help — this message\n\
              \n\
              Bot binary: {}\n\
-             Child env includes DISABLE_TELEGRAM_POLLING=true.",
+             Child env: DISABLE_TELEGRAM_POLLING=true, POLYBOT_SUPERVISOR_CHILD=1, DISABLE_TUI=true.",
             self.strategy_db_path,
             self.bot_command
         )
@@ -480,6 +567,8 @@ impl Supervisor {
         let mut cmd = Command::new(&self.bot_command);
         cmd.env("RUST_LOG", "info")
             .env("DISABLE_TELEGRAM_POLLING", "true")
+            .env("POLYBOT_SUPERVISOR_CHILD", "1")
+            .env("DISABLE_TUI", "true")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let child = match cmd.spawn() {
@@ -574,16 +663,29 @@ async fn main() {
         .install_default()
         .expect("rustls crypto provider");
 
+    // Same as `Config::from_env()` in main: load .env / polymarket_keys.env so TELEGRAM_* work from files.
+    dotenv::dotenv().ok();
+    dotenv::from_filename("polymarket_keys.env").ok();
+
     let mut sup = Supervisor::new();
     if sup.token.trim().is_empty() || sup.chat_id.trim().is_empty() {
         eprintln!("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID");
         std::process::exit(1);
     }
 
+    eprintln!(
+        "supervisor: pid={} exe={}",
+        std::process::id(),
+        std::env::current_exe().unwrap_or_default().display()
+    );
+
     let mut offset: i64 = 0;
     let mut seen: HashSet<i64> = HashSet::new();
     const SEEN_CAP: usize = 2048;
     let mut fail_attempts: u32 = 0;
+
+    sup.telegram_delete_webhook().await;
+    sup.telegram_log_webhook_info().await;
 
     loop {
         sup.notify_if_child_exited().await;
@@ -610,7 +712,21 @@ async fn main() {
         fail_attempts = 0;
 
         if !resp.status().is_success() {
-            eprintln!("supervisor: getUpdates HTTP {}", resp.status());
+            let status = resp.status();
+            if status.as_u16() == 409 {
+                eprintln!(
+                    "supervisor: getUpdates 409 Conflict — another getUpdates session exists for this bot token.\n\
+                     • On this PC: .\\scripts\\stop-telegram-pollers.ps1 then wait ~5s; or .\\scripts\\scan-telegram-processes.ps1 to find strays.\n\
+                     • Elsewhere: stop polymarket-bot/supervisor on EC2 or other machines using the same TELEGRAM_BOT_TOKEN.\n\
+                     • Last resort: @BotFather -> /revoke -> put the new token in .env\n\
+                     Retrying deleteWebhook + getUpdates in 15s..."
+                );
+                sup.telegram_delete_webhook().await;
+                sup.telegram_log_webhook_info().await;
+                sleep(Duration::from_secs(15)).await;
+                continue;
+            }
+            eprintln!("supervisor: getUpdates HTTP {}", status);
             sleep(Duration::from_secs(5)).await;
             continue;
         }
@@ -656,8 +772,14 @@ async fn main() {
                 continue;
             }
             let text = msg.text.unwrap_or_default();
+            let key = normalize_command(text.trim());
             let reply = sup.handle_command(text.trim()).await;
-            sup.send_message_with_retry(&reply).await;
+            let markup = if key == "/dashboard" {
+                telegram_webapp_dashboard_markup()
+            } else {
+                None
+            };
+            sup.send_message_with_retry(&reply, markup).await;
         }
         if max_id >= 0 {
             offset = max_id + 1;

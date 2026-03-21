@@ -8,6 +8,8 @@ use reqwest::Client;
 use rust_decimal::prelude::ToPrimitive;
 use serde::Deserialize;
 use std::collections::HashSet;
+use std::fs;
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -33,7 +35,7 @@ impl Default for TelegramDashboardState {
     }
 }
 
-/// Latest session id from `rounds.timestamp_utc` ordering (for supervisor DB reads).
+/// Latest session id from `rounds.timestamp_utc` ordering (legacy fallback when no log files).
 pub fn query_latest_session_id(db_path: &str) -> Result<Option<String>, rusqlite::Error> {
     use rusqlite::OptionalExtension;
     let conn = rusqlite::Connection::open(db_path)?;
@@ -43,6 +45,41 @@ pub fn query_latest_session_id(db_path: &str) -> Result<Option<String>, rusqlite
         |row| row.get(0),
     )
     .optional()
+}
+
+/// Session id from the newest `polymarket-bot.<session>.log` under `logs_dir` (by file mtime), matching `main.rs`.
+pub fn session_id_from_newest_bot_log(logs_dir: &str) -> Option<String> {
+    let dir = Path::new(logs_dir);
+    let entries = fs::read_dir(dir).ok()?;
+    let prefix = "polymarket-bot.";
+    let suffix = ".log";
+    let mut best: Option<(std::time::SystemTime, String)> = None;
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if !name.starts_with(prefix) || !name.ends_with(suffix) {
+            continue;
+        }
+        let sid = name[prefix.len()..name.len() - suffix.len()].to_string();
+        let meta = e.metadata().ok()?;
+        let mtime = meta.modified().ok()?;
+        match &best {
+            None => best = Some((mtime, sid)),
+            Some((t, _)) if mtime > *t => best = Some((mtime, sid)),
+            _ => {}
+        }
+    }
+    best.map(|(_, s)| s)
+}
+
+/// Which session supervisor `/stats` and `/pnl` should use: newest bot log (current run), else latest row in DB.
+pub fn resolve_session_id_for_supervisor(
+    db_path: &str,
+    logs_dir: &str,
+) -> Result<Option<String>, rusqlite::Error> {
+    if let Some(sid) = session_id_from_newest_bot_log(logs_dir) {
+        return Ok(Some(sid));
+    }
+    query_latest_session_id(db_path)
 }
 
 /// Outcome counts + total P&amp;L for one `session_id` (same query as `/stats`).
@@ -133,6 +170,34 @@ pub fn telegram_auth_from_env() -> (String, String) {
     )
 }
 
+/// Join `TELEGRAM_WEBAPP_PUBLIC_URL` with a path segment. If the base URL contains `?query`,
+/// the path is inserted before the query (avoids `host?x=/path` mistakes).
+fn join_webapp_base_path(base: &str, path: &str) -> String {
+    let path = path.trim_start_matches('/');
+    if let Some((base_no_q, q)) = base.split_once('?') {
+        let base_trim = base_no_q.trim_end_matches('/');
+        format!("{}/{}?{}", base_trim, path, q)
+    } else {
+        let base_trim = base.trim_end_matches('/');
+        format!("{}/{}", base_trim, path)
+    }
+}
+
+/// HTTPS URL for the live dashboard Mini App (`/telegram-dashboard`), if `TELEGRAM_WEBAPP_PUBLIC_URL` is set.
+/// Used by the supervisor `/dashboard` command to attach a WebApp button (same URL as `polymarket-bot` startup).
+pub fn webapp_dashboard_url_from_env() -> Option<String> {
+    let base = std::env::var("TELEGRAM_WEBAPP_PUBLIC_URL").ok()?;
+    let b = base.trim().trim_end_matches('/');
+    if b.is_empty() {
+        return None;
+    }
+    Some(join_webapp_base_path(b, "telegram-dashboard"))
+}
+
+fn webapp_base_looks_like_ngrok(base: &str) -> bool {
+    base.to_ascii_lowercase().contains("ngrok")
+}
+
 impl TelegramBot {
     pub fn new(dashboard: TelegramDashboardState) -> Self {
         let token = std::env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default();
@@ -146,8 +211,8 @@ impl TelegramBot {
             .filter(|s| !s.is_empty());
         let web_app_positions_url = base
             .as_ref()
-            .map(|b| format!("{}/telegram-positions", b));
-        let web_app_dashboard_url = base.map(|b| format!("{}/telegram-dashboard", b));
+            .map(|b| join_webapp_base_path(b, "telegram-positions"));
+        let web_app_dashboard_url = base.map(|b| join_webapp_base_path(&b, "telegram-dashboard"));
 
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(60))
@@ -223,6 +288,17 @@ impl TelegramBot {
                 text.push_str(
                     "Use the buttons below for the <b>live dashboard</b> inside Telegram (opens a web view; it refreshes automatically).\n\n",
                 );
+                let any_ngrok = inner
+                    .web_app_dashboard_url
+                    .as_deref()
+                    .or(inner.web_app_positions_url.as_deref())
+                    .map(webapp_base_looks_like_ngrok)
+                    .unwrap_or(false);
+                if any_ngrok {
+                    text.push_str(
+                        "<i>Free ngrok</i> shows a one-time “Visit Site” screen in the Mini App — tap it once; ngrok then remembers for several days. Paid ngrok or Cloudflare Tunnel skips that screen.\n\n",
+                    );
+                }
             } else {
                 text.push_str(
                     "<b>Mini App buttons</b> are off until you set <code>TELEGRAM_WEBAPP_PUBLIC_URL</code> to a public <b>HTTPS</b> URL that reaches this bot’s HTTP server (<code>TELEGRAM_WEBAPP_BIND</code>). \

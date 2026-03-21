@@ -15,6 +15,6 @@ $dir = Split-Path -Parent $profilePath
 if (-not (Test-Path -LiteralPath $dir)) {
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
 }
-Add-Content -LiteralPath $profilePath -Value "`n# polymarket-bot: polybot = Telegram supervisor`n$line`n"
+Add-Content -LiteralPath $profilePath -Value "`n# polymarket-bot: polybot = ngrok + Telegram Mini App dashboard`n$line`n"
 Write-Host ("Appended to: " + $profilePath)
 Write-Host "Restart PowerShell, or dot-source polybot.ps1 once in this session."

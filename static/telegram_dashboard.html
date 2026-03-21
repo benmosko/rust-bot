@@ -86,8 +86,9 @@
       <div class="val" id="bal">—</div>
     </div>
     <div class="card">
-      <div class="label">Session P&amp;L</div>
+      <div class="label">Net realized P&amp;L</div>
       <div class="val" id="pnl">—</div>
+      <div class="k" style="margin-top:6px;line-height:1.35">All resolved rounds since this run started (wins, losses, hedges). Telegram toasts are one round each.</div>
     </div>
     <div class="card">
       <div class="label">Uptime</div>
@@ -194,8 +195,11 @@
         } else {
           for (const p of positions) {
             const rem = Math.max(0, p.round_end - now);
+            const sub = rem > 0
+              ? rem + 's to round end'
+              : 'Round ended · position open until resolved';
             const li = document.createElement('li');
-            li.innerHTML = '<div class="row"><span><b>' + p.coin + '</b> ' + p.period + ' ' + p.side + '</span><span class="v">@ ' + p.entry_price.toFixed(4) + '</span></div><div style="margin-top:6px;font-size:0.85rem;color:var(--muted)">' + rem + 's to settlement</div>';
+            li.innerHTML = '<div class="row"><span><b>' + p.coin + '</b> ' + p.period + ' ' + p.side + '</span><span class="v">@ ' + p.entry_price.toFixed(4) + '</span></div><div style="margin-top:6px;font-size:0.85rem;color:var(--muted)">' + sub + '</div>';
             posList.appendChild(li);
           }
         }

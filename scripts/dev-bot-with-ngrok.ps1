@@ -3,27 +3,23 @@
 #
 # Usage (from repo root):
 #   .\scripts\dev-bot-with-ngrok.ps1
+# Or: polybot (loads polybot-env.ps1, same checks)
 #
-# Requires: ngrok in PATH, .env with TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID
+# Requires: ngrok in PATH, .env with TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID + PK
 $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $ProjectRoot
 
-function Import-DotEnv {
-    param([string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) { return }
-    Get-Content -LiteralPath $Path | ForEach-Object {
-        $line = $_.Trim()
-        if ($line -match '^\s*#' -or $line -eq '') { return }
-        $i = $line.IndexOf('=')
-        if ($i -lt 1) { return }
-        $k = $line.Substring(0, $i).Trim()
-        $v = $line.Substring($i + 1).Trim()
-        [Environment]::SetEnvironmentVariable($k, $v, "Process")
-    }
+. "$PSScriptRoot\polybot-env.ps1"
+if (-not (Test-PolybotPrerequisites -ProjectRoot $ProjectRoot)) {
+    exit 1
 }
 
-Import-DotEnv (Join-Path $ProjectRoot ".env")
+# Standalone run: Telegram long-poll + Mini App HTTP (not supervisor child).
+$env:DISABLE_TELEGRAM_POLLING = "false"
+Remove-Item Env:\POLYBOT_SUPERVISOR_CHILD -ErrorAction SilentlyContinue
+
+New-Item -ItemType Directory -Force -Path (Join-Path $ProjectRoot "logs") | Out-Null
 
 $port = 8787
 if ($env:TELEGRAM_WEBAPP_BIND) {
@@ -32,14 +28,6 @@ if ($env:TELEGRAM_WEBAPP_BIND) {
     }
 }
 $env:TELEGRAM_WEBAPP_BIND = "127.0.0.1:$port"
-
-$ngrok = Get-Command ngrok -ErrorAction SilentlyContinue
-if (-not $ngrok) {
-    Write-Host "ngrok not found in PATH." -ForegroundColor Red
-    Write-Host "Install: https://ngrok.com/download  or: winget install ngrok.ngrok"
-    Write-Host "Then: ngrok config add-authtoken <token>   (free account: https://dashboard.ngrok.com )"
-    exit 1
-}
 
 Write-Host "Starting ngrok -> http 127.0.0.1:$port ..." -ForegroundColor Cyan
 $ngrokProc = Start-Process -FilePath "ngrok" -ArgumentList @("http", "$port") -PassThru -WindowStyle Hidden
@@ -61,13 +49,20 @@ try {
         if ($publicUrl) { break }
     }
     if (-not $publicUrl) {
-        Write-Host 'Could not read ngrok HTTPS URL from http://127.0.0.1:4040 - is ngrok authtoken configured?' -ForegroundColor Red
+        Write-Host 'Could not read ngrok HTTPS URL from http://127.0.0.1:4040' -ForegroundColor Red
+        Write-Host 'Try: ngrok update   (accounts often require agent 3.20+)' -ForegroundColor Yellow
+        Write-Host 'Then: ngrok config add-authtoken YOUR_TOKEN if auth still fails' -ForegroundColor Yellow
         exit 1
     }
     $env:TELEGRAM_WEBAPP_PUBLIC_URL = $publicUrl
     Write-Host "TELEGRAM_WEBAPP_PUBLIC_URL = $publicUrl" -ForegroundColor Green
     Write-Host "TELEGRAM_WEBAPP_BIND       = $($env:TELEGRAM_WEBAPP_BIND)" -ForegroundColor Green
-    Write-Host "`nStarting polymarket-bot - Ctrl+C stops bot, then we stop ngrok...`n" -ForegroundColor Cyan
+    if ($publicUrl -match 'ngrok') {
+        Write-Host ''
+        Write-Host 'Free ngrok: one-time Visit Site in Telegram Mini App; tap once. Paid ngrok or Cloudflare Tunnel skips that.' -ForegroundColor Yellow
+    }
+    Write-Host ''
+    Write-Host 'Starting polymarket-bot (Ctrl+C stops bot, then ngrok stops)...' -ForegroundColor Cyan
 
     $exe = Join-Path $ProjectRoot "target\release-fast\polymarket-bot.exe"
     if (-not (Test-Path -LiteralPath $exe)) {
@@ -75,10 +70,15 @@ try {
         & cargo build --profile release-fast --bin polymarket-bot
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     }
+    # Rust dotenv does not overwrite existing process env -- drop file-backed keys so .env + polymarket_keys.env win.
+    foreach ($k in @('PK','POLYMARKET_PRIVATE_KEY','FUNDER','FUNDER_ADDRESS','TELEGRAM_BOT_TOKEN','TELEGRAM_CHAT_ID')) {
+        Remove-Item "Env:$k" -ErrorAction SilentlyContinue
+    }
     & $exe
 } finally {
     if ($ngrokProc -and -not $ngrokProc.HasExited) {
         Stop-Process -Id $ngrokProc.Id -Force -ErrorAction SilentlyContinue
     }
-    Write-Host "`nngrok stopped." -ForegroundColor DarkGray
+    Write-Host ''
+    Write-Host 'ngrok stopped.' -ForegroundColor DarkGray
 }

@@ -65,10 +65,15 @@ async fn main() -> Result<()> {
     // Check if we're in debug mode (RUST_LOG=debug)
     let rust_log_env = std::env::var("RUST_LOG").unwrap_or_else(|_| config.rust_log.clone());
     let is_debug_mode = rust_log_env.to_lowercase() == "debug";
+    // Headless (e.g. supervisor child with stdout/stderr nul): skip ratatui — TUI init fails without a TTY.
+    let disable_tui = std::env::var("DISABLE_TUI")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let skip_tui = is_debug_mode || disable_tui;
 
-    // TUI event channel (dashboard consumes events) — only needed if not in debug mode.
+    // TUI event channel (dashboard consumes events) — only when we render the TUI.
     // Trade Log lines come only from explicit TuiEvent::TradeLog (strategies), not from tracing.
-    let tui_tx_rx = if !is_debug_mode {
+    let tui_tx_rx = if !skip_tui {
         // Large buffer: RoundUpdate bursts + trade log; try_send drops on full and prices go stale
         let (tx, rx) = mpsc::channel(4096);
         Some((tx, rx))
@@ -218,7 +223,7 @@ async fn main() -> Result<()> {
         Arc::new(std::sync::Mutex::new(Vec::new()));
 
     // Spawn TUI (when user presses q, TUI exits and we cancel main_shutdown)
-    // Skip TUI in debug mode
+    // Skip TUI in debug mode or when DISABLE_TUI=1 (headless)
     let tui_tx = if let Some((tx, rx)) = tui_tx_rx {
         let main_shutdown_for_tui = main_shutdown.clone();
         let dry_run_for_tui = dry_run.clone();
@@ -493,12 +498,20 @@ async fn main() -> Result<()> {
             Err(_) => warn!(bind = %bind_s, "TELEGRAM_WEBAPP_BIND invalid; Mini App HTTP not started"),
         }
     }
+    // Supervisor-spawned child: never poll Telegram here (only one getUpdates per bot token).
+    if std::env::var("POLYBOT_SUPERVISOR_CHILD")
+        .map(|s| s == "1")
+        .unwrap_or(false)
+    {
+        std::env::set_var("DISABLE_TELEGRAM_POLLING", "true");
+    }
+    // Default: polling enabled for standalone. Supervisor sets DISABLE_TELEGRAM_POLLING=true via POLYBOT_SUPERVISOR_CHILD.
     let telegram_polling_disabled = match std::env::var("DISABLE_TELEGRAM_POLLING") {
         Ok(s) => {
             let s = s.trim().to_ascii_lowercase();
             !matches!(s.as_str(), "false" | "0" | "no" | "off")
         }
-        Err(_) => true,
+        Err(_) => false,
     };
     if telegram_polling_disabled {
         info!("Telegram polling disabled (supervisor mode)");
