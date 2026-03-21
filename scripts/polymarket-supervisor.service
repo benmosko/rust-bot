@@ -1,0 +1,18 @@
+[Unit]
+Description=Polymarket Telegram supervisor (long-poll; spawns trading bot via /startbot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/polymarket-bot
+EnvironmentFile=-/home/ubuntu/polymarket-bot/.env
+ExecStart=/home/ubuntu/polymarket-bot/target/release/supervisor
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

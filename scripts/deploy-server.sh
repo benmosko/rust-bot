@@ -24,14 +24,27 @@ git pull --ff-only
 # Rust toolchain must be installed on the server (rustup).
 command -v cargo >/dev/null || { echo "Install rust: https://rustup.rs"; exit 1; }
 
-cargo build --release --locked --bin polymarket-bot
+cargo build --release --locked --bin polymarket-bot --bin supervisor
+
+SUPERVISOR_SERVICE="${SUPERVISOR_SERVICE:-polymarket-supervisor}"
+
+if systemctl is-enabled "$SUPERVISOR_SERVICE" &>/dev/null; then
+  sudo systemctl restart "$SUPERVISOR_SERVICE"
+  sudo systemctl --no-pager status "$SUPERVISOR_SERVICE" || true
+else
+  echo "Supervisor service not installed yet (recommended: always-on Telegram control)."
+  echo "  sudo cp scripts/polymarket-supervisor.service /etc/systemd/system/"
+  echo "  sudo sed -i \"s|/home/ubuntu|$HOME|g\" /etc/systemd/system/polymarket-supervisor.service"
+  echo "  sudo systemctl daemon-reload && sudo systemctl enable --now $SUPERVISOR_SERVICE"
+fi
 
 if systemctl is-enabled "$SERVICE_NAME" &>/dev/null; then
   sudo systemctl restart "$SERVICE_NAME"
   sudo systemctl --no-pager status "$SERVICE_NAME" || true
 else
-  echo "Service not installed yet. One-time setup:"
+  echo "Trading bot service not installed yet. One-time setup:"
   echo "  sudo cp scripts/polymarket-bot.service /etc/systemd/system/"
   echo "  sudo sed -i \"s|/home/ubuntu|$HOME|g\" /etc/systemd/system/polymarket-bot.service"
   echo "  sudo systemctl daemon-reload && sudo systemctl enable --now polymarket-bot"
+  echo "If you use only the supervisor + /startbot, skip enabling polymarket-bot (avoid two bots)."
 fi
