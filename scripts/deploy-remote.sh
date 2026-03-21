@@ -2,6 +2,11 @@
 # Consumed by deploy-from-local.ps1 (piped over SSH). Not run on the server by systemd.
 set -euo pipefail
 cd ~/polymarket-bot
+if [[ -f "$HOME/.cargo/env" ]]; then
+  # shellcheck source=/dev/null
+  source "$HOME/.cargo/env"
+fi
+export PATH="$HOME/.cargo/bin:$PATH"
 git pull --ff-only
 cargo build --release --locked --bin polymarket-bot --bin supervisor
 sudo systemctl restart polymarket-supervisor 2>/dev/null || true
