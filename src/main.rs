@@ -464,7 +464,10 @@ async fn main() -> Result<()> {
         polymarket_bot::config::StrategyMode::All => "all",
     };
 
-    let telegram = Arc::new(polymarket_bot::telegram::TelegramBot::new());
+    let telegram_dashboard = polymarket_bot::telegram::TelegramDashboardState::default();
+    let telegram = Arc::new(polymarket_bot::telegram::TelegramBot::new(
+        telegram_dashboard.clone(),
+    ));
     if let Ok(bind_s) = std::env::var("TELEGRAM_WEBAPP_BIND") {
         match bind_s.parse::<std::net::SocketAddr>() {
             Ok(addr) => {
@@ -490,17 +493,29 @@ async fn main() -> Result<()> {
             Err(_) => warn!(bind = %bind_s, "TELEGRAM_WEBAPP_BIND invalid; Mini App HTTP not started"),
         }
     }
-    telegram.start_polling(
-        config.polygon_rpc_url.clone(),
-        "logs/strategy.db".to_string(),
-        session_id.clone(),
-        round_history.clone(),
-        trading_paused.clone(),
-        dry_run.clone(),
-        execution.clone(),
-        strategy_mode_str.to_string(),
-        session_start,
-    );
+    let telegram_polling_disabled = match std::env::var("DISABLE_TELEGRAM_POLLING") {
+        Ok(s) => {
+            let s = s.trim().to_ascii_lowercase();
+            !matches!(s.as_str(), "false" | "0" | "no" | "off")
+        }
+        Err(_) => true,
+    };
+    if telegram_polling_disabled {
+        info!("Telegram polling disabled (supervisor mode)");
+    } else {
+        info!("Telegram polling enabled (standalone mode)");
+        telegram.start_polling(
+            config.polygon_rpc_url.clone(),
+            "logs/strategy.db".to_string(),
+            session_id.clone(),
+            round_history.clone(),
+            trading_paused.clone(),
+            dry_run.clone(),
+            execution.clone(),
+            strategy_mode_str.to_string(),
+            session_start,
+        );
+    }
 
     loop {
         if main_shutdown.is_cancelled() {
@@ -716,6 +731,10 @@ async fn main() -> Result<()> {
                                     let sniper_strategy_logger = strategy_logger.clone();
                                     let sniper_chainlink = chainlink_tracker.clone();
                                     let sniper_binance_history = binance_spot_history.clone();
+                                    let sniper_momentum_blocks =
+                                        telegram_dashboard.momentum_blocks.clone();
+                                    let sniper_last_momentum_block =
+                                        telegram_dashboard.last_momentum_block.clone();
                                     let sniper_handle = tokio::spawn(async move {
                                         let mut sniper = polymarket_bot::sniper::Sniper::new(
                                             sniper_market,
@@ -737,6 +756,8 @@ async fn main() -> Result<()> {
                                             sniper_strategy_logger,
                                             sniper_chainlink,
                                             sniper_binance_history,
+                                            sniper_momentum_blocks,
+                                            sniper_last_momentum_block,
                                         );
                                         if let Err(e) = sniper.run(sniper_shutdown).await {
                                             error!(error = %e, "Sniper error");
@@ -911,6 +932,10 @@ async fn main() -> Result<()> {
                                     let sniper_strategy_logger = strategy_logger.clone();
                                     let sniper_chainlink = chainlink_tracker.clone();
                                     let sniper_binance_history = binance_spot_history.clone();
+                                    let sniper_momentum_blocks =
+                                        telegram_dashboard.momentum_blocks.clone();
+                                    let sniper_last_momentum_block =
+                                        telegram_dashboard.last_momentum_block.clone();
                                     let sniper_handle = tokio::spawn(async move {
                                         let mut sniper = polymarket_bot::sniper::Sniper::new(
                                             sniper_market,
@@ -932,6 +957,8 @@ async fn main() -> Result<()> {
                                             sniper_strategy_logger,
                                             sniper_chainlink,
                                             sniper_binance_history,
+                                            sniper_momentum_blocks,
+                                            sniper_last_momentum_block,
                                         );
                                         if let Err(e) = sniper.run(sniper_shutdown).await {
                                             error!(error = %e, "Sniper error");

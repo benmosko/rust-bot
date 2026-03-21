@@ -9,10 +9,96 @@ use rust_decimal::prelude::ToPrimitive;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tokio::time::{sleep, Duration};
 use tracing::{error, warn};
+
+/// Shared dashboard counters and hooks (Telegram `/dashboard`, `send_round_resolution`, sniper momentum).
+#[derive(Clone)]
+pub struct TelegramDashboardState {
+    pub last_resolution: Arc<Mutex<Option<(String, Instant)>>>,
+    pub momentum_blocks: Arc<AtomicU64>,
+    pub last_momentum_block: Arc<Mutex<Option<String>>>,
+}
+
+impl Default for TelegramDashboardState {
+    fn default() -> Self {
+        Self {
+            last_resolution: Arc::new(Mutex::new(None)),
+            momentum_blocks: Arc::new(AtomicU64::new(0)),
+            last_momentum_block: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+/// Latest session id from `rounds.timestamp_utc` ordering (for supervisor DB reads).
+pub fn query_latest_session_id(db_path: &str) -> Result<Option<String>, rusqlite::Error> {
+    use rusqlite::OptionalExtension;
+    let conn = rusqlite::Connection::open(db_path)?;
+    conn.query_row(
+        "SELECT session_id FROM rounds ORDER BY timestamp_utc DESC LIMIT 1",
+        [],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+/// Outcome counts + total P&amp;L for one `session_id` (same query as `/stats`).
+pub struct SessionStatsSnapshot {
+    pub won: i64,
+    pub lost: i64,
+    pub hedged: i64,
+    pub tie: i64,
+    pub total_pnl: f64,
+}
+
+pub fn query_session_stats(
+    db_path: &str,
+    session_id: &str,
+) -> Result<SessionStatsSnapshot, String> {
+    use rusqlite::params;
+    let conn = rusqlite::Connection::open(db_path).map_err(|e| e.to_string())?;
+    let (won, lost, hedged, tie, total_pnl): (i64, i64, i64, i64, f64) = conn
+        .query_row(
+            r#"
+            SELECT
+              COALESCE(SUM(CASE WHEN outcome = 'WON' THEN 1 ELSE 0 END), 0),
+              COALESCE(SUM(CASE WHEN outcome = 'LOST' THEN 1 ELSE 0 END), 0),
+              COALESCE(SUM(CASE WHEN outcome = 'HEDGED' THEN 1 ELSE 0 END), 0),
+              COALESCE(SUM(CASE WHEN outcome = 'TIE' THEN 1 ELSE 0 END), 0),
+              COALESCE(SUM(pnl), 0)
+            FROM rounds WHERE session_id = ?1
+            "#,
+            params![session_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(SessionStatsSnapshot {
+        won,
+        lost,
+        hedged,
+        tie,
+        total_pnl,
+    })
+}
+
+/// Session P&amp;L sum and row count (same as `/pnl`).
+pub fn query_session_pnl(
+    db_path: &str,
+    session_id: &str,
+) -> Result<(f64, i64), String> {
+    use rusqlite::params;
+    let conn = rusqlite::Connection::open(db_path).map_err(|e| e.to_string())?;
+    conn
+        .query_row(
+            "SELECT COALESCE(SUM(pnl), 0), COUNT(*) FROM rounds WHERE session_id = ?1",
+            params![session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|e| e.to_string())
+}
 
 /// `/balance` command: fixed proxy wallet from project docs.
 const BALANCE_PROXY_WALLET: &str = "0xD6d35B777089235c9CCDcD4830BF1BBda2A06300";
@@ -31,6 +117,7 @@ struct TelegramBotInner {
     web_app_positions_url: Option<String>,
     /// Base + `/telegram-dashboard` for live dashboard Mini App.
     web_app_dashboard_url: Option<String>,
+    dashboard: TelegramDashboardState,
 }
 
 struct TelegramReply {
@@ -47,7 +134,7 @@ pub fn telegram_auth_from_env() -> (String, String) {
 }
 
 impl TelegramBot {
-    pub fn new() -> Self {
+    pub fn new(dashboard: TelegramDashboardState) -> Self {
         let token = std::env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default();
         let chat_id = std::env::var("TELEGRAM_CHAT_ID").unwrap_or_default();
 
@@ -79,6 +166,7 @@ impl TelegramBot {
                 enabled,
                 web_app_positions_url,
                 web_app_dashboard_url,
+                dashboard,
             }),
         }
     }
@@ -153,6 +241,27 @@ impl TelegramBot {
             close = chainlink_close,
             tr = time_remaining_secs,
         );
+        let emoji = match outcome.to_uppercase().as_str() {
+            "WON" => "✅",
+            "HEDGED" => "🔄",
+            "LOST" => "❌",
+            "TIE" => "➖",
+            _ => "➖",
+        };
+        let outcome_u = outcome.to_uppercase();
+        let summary_line = format!(
+            "{emoji} {coin_u} {period} {side} — {outcome_u} {pnl_sign}${pnl_abs:.2}",
+            emoji = emoji,
+            coin_u = coin_u,
+            period = period,
+            side = side,
+            outcome_u = outcome_u,
+            pnl_sign = pnl_sign,
+            pnl_abs = pnl.abs(),
+        );
+        if let Ok(mut g) = self.inner.dashboard.last_resolution.lock() {
+            *g = Some((summary_line, Instant::now()));
+        }
         self.send_message(&msg);
     }
 
@@ -242,6 +351,7 @@ impl TelegramBot {
                                         &execution,
                                         &strategy_mode_label,
                                         session_start,
+                                        &inner.dashboard,
                                     )
                                     .await
                                     {
@@ -353,6 +463,7 @@ async fn handle_command(
     execution: &Arc<ExecutionEngine>,
     strategy_mode_label: &str,
     session_start: chrono::DateTime<chrono::Utc>,
+    dashboard: &TelegramDashboardState,
 ) -> Result<TelegramReply, String> {
     let key = normalize_command(text);
     if key == "/balance" {
@@ -366,6 +477,22 @@ async fn handle_command(
     }
     if key == "/stats" {
         return cmd_stats(strategy_db_path, session_id);
+    }
+    if key == "/dashboard" {
+        return cmd_dashboard(
+            rpc_url,
+            strategy_db_path,
+            session_id,
+            round_history,
+            web_app_positions_url,
+            web_app_dashboard_url,
+            trading_paused,
+            dry_run,
+            strategy_mode_label,
+            session_start,
+            dashboard,
+        )
+        .await;
     }
     if key == "/pause" {
         trading_paused.store(true, Ordering::Relaxed);
@@ -483,15 +610,7 @@ async fn cmd_balance(rpc_url: &str) -> Result<TelegramReply, String> {
 }
 
 fn cmd_pnl(db_path: &str, session_id: &str) -> Result<TelegramReply, String> {
-    use rusqlite::params;
-    let conn = rusqlite::Connection::open(db_path).map_err(|e| e.to_string())?;
-    let (sum, n): (f64, i64) = conn
-        .query_row(
-            "SELECT COALESCE(SUM(pnl), 0), COUNT(*) FROM rounds WHERE session_id = ?1",
-            params![session_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|e| e.to_string())?;
+    let (sum, n) = query_session_pnl(db_path, session_id)?;
     let sign = if sum >= 0.0 { "+" } else { "-" };
     Ok(TelegramReply {
         text: format!(
@@ -548,45 +667,206 @@ fn period_display(p: Period) -> String {
 }
 
 fn cmd_stats(db_path: &str, session_id: &str) -> Result<TelegramReply, String> {
-    use rusqlite::params;
-    let conn = rusqlite::Connection::open(db_path).map_err(|e| e.to_string())?;
-    let (won, lost, hedged, tie, total_pnl): (i64, i64, i64, i64, f64) = conn
-        .query_row(
-            r#"
-            SELECT
-              COALESCE(SUM(CASE WHEN outcome = 'WON' THEN 1 ELSE 0 END), 0),
-              COALESCE(SUM(CASE WHEN outcome = 'LOST' THEN 1 ELSE 0 END), 0),
-              COALESCE(SUM(CASE WHEN outcome = 'HEDGED' THEN 1 ELSE 0 END), 0),
-              COALESCE(SUM(CASE WHEN outcome = 'TIE' THEN 1 ELSE 0 END), 0),
-              COALESCE(SUM(pnl), 0)
-            FROM rounds WHERE session_id = ?1
-            "#,
-            params![session_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
-        )
-        .map_err(|e| e.to_string())?;
-
-    let wr = if won + lost > 0 {
-        (won as f64 / (won + lost) as f64) * 100.0
+    let s = query_session_stats(db_path, session_id)?;
+    let wr = if s.won + s.lost > 0 {
+        (s.won as f64 / (s.won + s.lost) as f64) * 100.0
     } else {
         0.0
     };
-    let pnl_sign = if total_pnl >= 0.0 { "+" } else { "-" };
+    let pnl_sign = if s.total_pnl >= 0.0 { "+" } else { "-" };
     Ok(TelegramReply {
         text: format!(
             "📈 Session Stats\n\
              WON: {won} | LOST: {lost} | HEDGED: {hedged} | TIE: {tie}\n\
              Win Rate: {wr:.1}%\n\
              Total P&L: {pnl_sign}${tp:.2}",
-            won = won,
-            lost = lost,
-            hedged = hedged,
-            tie = tie,
+            won = s.won,
+            lost = s.lost,
+            hedged = s.hedged,
+            tie = s.tie,
             wr = wr,
             pnl_sign = pnl_sign,
-            tp = total_pnl.abs(),
+            tp = s.total_pnl.abs(),
         ),
         reply_markup: None,
+    })
+}
+
+fn format_uptime_short_hm(uptime_secs: i64) -> String {
+    let h = uptime_secs / 3600;
+    let m = (uptime_secs % 3600) / 60;
+    if uptime_secs < 60 {
+        format!("{}s", uptime_secs)
+    } else if h > 0 {
+        format!("{}h {}m", h, m)
+    } else {
+        format!("{}m", m)
+    }
+}
+
+fn format_relative_since(at: Instant) -> String {
+    let secs = at.elapsed().as_secs();
+    if secs < 60 {
+        format!("{} seconds ago", secs)
+    } else if secs < 3600 {
+        format!("{} minutes ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{} hours ago", secs / 3600)
+    } else {
+        format!("{} days ago", secs / 86400)
+    }
+}
+
+fn format_positions_tree_dashboard(
+    round_history: &Arc<Mutex<Vec<RoundHistoryEntry>>>,
+) -> Result<String, String> {
+    let guard = round_history.lock().map_err(|e| e.to_string())?;
+    let now = chrono::Utc::now().timestamp();
+    let mut lines: Vec<String> = Vec::new();
+    for e in guard.iter() {
+        if !matches!(e.status, RoundHistoryStatus::Open) {
+            continue;
+        }
+        let rem = (e.round_end - now).max(0);
+        let ep = e.entry_price.to_f64().unwrap_or(0.0);
+        lines.push(format!(
+            "{} {} {} @ ${:.2} — {}s left",
+            coin_display(e.coin),
+            period_display(e.period),
+            e.side_label,
+            ep,
+            rem,
+        ));
+    }
+    let n = lines.len();
+    if n == 0 {
+        return Ok("📍 Open Positions (0)\n└ None".to_string());
+    }
+    let mut out = format!("📍 Open Positions ({})\n", n);
+    for (i, line) in lines.iter().enumerate() {
+        let prefix = if i + 1 == lines.len() { "└" } else { "├" };
+        out.push_str(&format!("{} {}\n", prefix, line));
+    }
+    Ok(out.trim_end().to_string())
+}
+
+async fn cmd_dashboard(
+    rpc_url: &str,
+    strategy_db_path: &str,
+    session_id: &str,
+    round_history: &Arc<Mutex<Vec<RoundHistoryEntry>>>,
+    web_app_positions_url: Option<&str>,
+    web_app_dashboard_url: Option<&str>,
+    trading_paused: &Arc<AtomicBool>,
+    dry_run: &Arc<AtomicBool>,
+    strategy_mode_label: &str,
+    session_start: chrono::DateTime<chrono::Utc>,
+    dashboard: &TelegramDashboardState,
+) -> Result<TelegramReply, String> {
+    let addr = Address::from_str(BALANCE_PROXY_WALLET).map_err(|e| e.to_string())?;
+    let bal = fetch_usdc_balance(rpc_url, addr)
+        .await
+        .map_err(|e| e.to_string())?;
+    let bal_f = bal.to_f64().unwrap_or(0.0);
+
+    let uptime_secs = (chrono::Utc::now() - session_start)
+        .num_seconds()
+        .max(0);
+    let uptime_str = format_uptime_short_hm(uptime_secs);
+
+    let paused = trading_paused.load(Ordering::Relaxed);
+    let dr = dry_run.load(Ordering::Relaxed);
+    let status_line = if paused {
+        "⏸ Status: Trading Paused"
+    } else if dr {
+        "🟡 Status: Trading Active (dry run)"
+    } else {
+        "🟢 Status: Trading Active"
+    };
+
+    let stats_block = match query_session_stats(strategy_db_path, session_id) {
+        Ok(s) => {
+            let trades_total = s.won + s.lost + s.hedged + s.tie;
+            let wr = if s.won + s.lost > 0 {
+                (s.won as f64 / (s.won + s.lost) as f64) * 100.0
+            } else {
+                0.0
+            };
+            let pnl_sign = if s.total_pnl >= 0.0 { "+" } else { "-" };
+            format!(
+                "📈 Session Stats\n\
+                 ├ Trades: {}\n\
+                 ├ Won: {} | Lost: {} | Hedged: {} | Tie: {}\n\
+                 ├ Win Rate: {:.1}%\n\
+                 └ P&L: {}${:.4}",
+                trades_total,
+                s.won,
+                s.lost,
+                s.hedged,
+                s.tie,
+                wr,
+                pnl_sign,
+                s.total_pnl.abs(),
+            )
+        }
+        Err(_) => "📈 Session Stats\n└ (no data)".to_string(),
+    };
+
+    let positions_text = format_positions_tree_dashboard(round_history)?;
+
+    let blocked = dashboard.momentum_blocks.load(Ordering::Relaxed);
+    let last_block = dashboard
+        .last_momentum_block
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .unwrap_or_else(|| "—".to_string());
+
+    let momentum_block = format!(
+        "🛡 Momentum Filter\n\
+         ├ Blocked: {} entries this session\n\
+         └ Last block: {}",
+        blocked, last_block
+    );
+
+    let last_res_block = match dashboard.last_resolution.lock().ok().and_then(|g| g.clone()) {
+        Some((line, at)) => {
+            let rel = format_relative_since(at);
+            format!("🕐 Last Resolution\n├ {}\n└ {}", line, rel)
+        }
+        None => "🕐 Last Resolution\n└ No resolutions yet".to_string(),
+    };
+
+    let text = format!(
+        "📊 Polybot Dashboard\n\
+         ━━━━━━━━━━━━━━━━━━━━\n\
+         \n\
+         💰 Balance: ${:.2} USDC\n\
+         ⏱ Uptime: {}\n\
+         🔄 Mode: {}\n\
+         {}\n\
+         \n\
+         {}\n\
+         \n\
+         {}\n\
+         \n\
+         {}\n\
+         \n\
+         {}",
+        bal_f,
+        uptime_str,
+        strategy_mode_label,
+        status_line,
+        stats_block,
+        positions_text,
+        momentum_block,
+        last_res_block,
+    );
+
+    let reply_markup = web_app_keyboard(web_app_positions_url, web_app_dashboard_url);
+    Ok(TelegramReply {
+        text,
+        reply_markup,
     })
 }
 
@@ -595,6 +875,7 @@ fn help_text() -> String {
      /pnl — session P&L and trade count from strategy DB\n\
      /positions — open sniper positions; Mini App buttons when TELEGRAM_WEBAPP_PUBLIC_URL is set\n\
      /stats — session outcome counts, win rate, total P&L\n\
+     /dashboard — combined balance, uptime, mode, stats, positions, momentum, last resolution\n\
      /pause — pause trading (blocks new orders; cancels open orders)\n\
      /resume — resume trading after /pause\n\
      /status — trading paused/active, dry run, strategy mode, uptime\n\

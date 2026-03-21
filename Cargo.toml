@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 polymarket-client-sdk = { version = "0.4", features = ["clob", "ws", "data"] }
 # `full` pulls in many unused modules; explicit features cut compile time a lot.
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "process"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -42,6 +42,10 @@ sha2 = "0.10"
 [[bin]]
 name = "test-order"
 path = "src/bin/test_order.rs"
+
+[[bin]]
+name = "supervisor"
+path = "src/bin/supervisor.rs"
 
 # ---- Faster iteration ----
 # Dev: less debug info = quicker compiles; stack traces still have file/line.

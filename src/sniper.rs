@@ -21,7 +21,7 @@ use rust_decimal_macros::dec;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::sync::{broadcast::error::RecvError, watch, mpsc};
 use tokio::time::{sleep, Duration};
@@ -87,6 +87,8 @@ pub struct Sniper {
     strategy_logger: Arc<Mutex<StrategyLogger>>,
     chainlink_tracker: Arc<ChainlinkTracker>,
     binance_spot_history: SharedBinanceSpotHistory,
+    momentum_blocks: Arc<AtomicU64>,
+    last_momentum_block: Arc<Mutex<Option<String>>>,
 }
 
 impl Sniper {
@@ -110,6 +112,8 @@ impl Sniper {
         strategy_logger: Arc<Mutex<StrategyLogger>>,
         chainlink_tracker: Arc<ChainlinkTracker>,
         binance_spot_history: SharedBinanceSpotHistory,
+        momentum_blocks: Arc<AtomicU64>,
+        last_momentum_block: Arc<Mutex<Option<String>>>,
     ) -> Self {
         let status_key = strategy_status_key(market.coin, market.period, market.round_start, "sniper");
         strategy_status.insert(status_key.clone(), "Snp: Waiting".to_string());
@@ -136,27 +140,29 @@ impl Sniper {
             strategy_logger,
             chainlink_tracker,
             binance_spot_history,
+            momentum_blocks,
+            last_momentum_block,
         }
     }
 
     /// Last gate before placing GTC: block fast mean reversion toward round open (Binance vs `opening_price`).
-    /// Returns `true` if this leg should **not** be entered. Fails open when history is missing or ambiguous.
-    fn momentum_reversal_blocks_entry(&self, side_name: &str) -> bool {
+    /// Returns a short description when this leg should **not** be entered. Fails open when history is missing or ambiguous.
+    fn momentum_reversal_block_detail(&self, side_name: &str) -> Option<String> {
         let side_label = if side_name == "YES" { "UP" } else { "DOWN" };
         let opening_price = match self.opening_price.to_f64() {
             Some(p) if p > 0.0 => p,
-            _ => return false,
+            _ => return None,
         };
         let current_spot = match self.spot_receiver.borrow().price.to_f64() {
             Some(p) if p > 0.0 => p,
-            _ => return false,
+            _ => return None,
         };
         let spot_10s_ago = match spot_price_for_momentum_reversal(
             &self.binance_spot_history,
             self.market.coin,
         ) {
             Some(p) if p > 0.0 => p,
-            _ => return false,
+            _ => return None,
         };
 
         let current_distance = (current_spot - opening_price).abs();
@@ -185,7 +191,12 @@ impl Sniper {
                 recovery_ratio = %recovery_ratio,
                 "Momentum reversal filter: BLOCKED entry — price recovering toward open"
             );
-            return true;
+            let coin_u = self.market.coin.as_str().to_uppercase();
+            let period_m = format!("{}m", self.market.period.as_minutes());
+            return Some(format!(
+                "{} {} {} (recovery {:.2})",
+                coin_u, period_m, side_label, recovery_ratio
+            ));
         }
 
         debug!(
@@ -193,7 +204,7 @@ impl Sniper {
             recovery_ratio = %recovery_ratio,
             "Momentum filter: OK"
         );
-        false
+        None
     }
 
     fn sniper_entry_key(&self, side_name: &str) -> SniperEntryKey {
@@ -674,13 +685,23 @@ impl Sniper {
 
                     // Last gate before place: momentum reversal (Binance vs round open). Dual: abort all if any leg blocks.
                     if plans.len() == 2 {
-                        let block_first = self.momentum_reversal_blocks_entry(&plans[0].0);
-                        let block_second = self.momentum_reversal_blocks_entry(&plans[1].0);
-                        if block_first || block_second {
+                        let d1 = self.momentum_reversal_block_detail(&plans[0].0);
+                        let d2 = self.momentum_reversal_block_detail(&plans[1].0);
+                        if let Some(detail) = d1.or(d2) {
+                            self.momentum_blocks.fetch_add(1, Ordering::Relaxed);
+                            if let Ok(mut g) = self.last_momentum_block.lock() {
+                                *g = Some(detail);
+                            }
                             self.clear_pending_keys(&reserved_keys);
                             continue;
                         }
-                    } else if self.momentum_reversal_blocks_entry(&plans[0].0) {
+                    } else if let Some(detail) =
+                        self.momentum_reversal_block_detail(&plans[0].0)
+                    {
+                        self.momentum_blocks.fetch_add(1, Ordering::Relaxed);
+                        if let Ok(mut g) = self.last_momentum_block.lock() {
+                            *g = Some(detail);
+                        }
                         self.clear_pending_keys(&reserved_keys);
                         continue;
                     }
