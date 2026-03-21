@@ -61,13 +61,13 @@ try {
         if ($publicUrl) { break }
     }
     if (-not $publicUrl) {
-        Write-Host "Could not read ngrok HTTPS URL from http://127.0.0.1:4040 — is ngrok authtoken configured?" -ForegroundColor Red
+        Write-Host 'Could not read ngrok HTTPS URL from http://127.0.0.1:4040 - is ngrok authtoken configured?' -ForegroundColor Red
         exit 1
     }
     $env:TELEGRAM_WEBAPP_PUBLIC_URL = $publicUrl
     Write-Host "TELEGRAM_WEBAPP_PUBLIC_URL = $publicUrl" -ForegroundColor Green
     Write-Host "TELEGRAM_WEBAPP_BIND       = $($env:TELEGRAM_WEBAPP_BIND)" -ForegroundColor Green
-    Write-Host "`nStarting polymarket-bot (Ctrl+C stops bot; then we stop ngrok)...`n" -ForegroundColor Cyan
+    Write-Host "`nStarting polymarket-bot - Ctrl+C stops bot, then we stop ngrok...`n" -ForegroundColor Cyan
 
     $exe = Join-Path $ProjectRoot "target\release-fast\polymarket-bot.exe"
     if (-not (Test-Path -LiteralPath $exe)) {

@@ -5,7 +5,7 @@
 // Run with the same TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID as the main bot.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::Path;
 use std::process::Stdio;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
@@ -40,11 +40,23 @@ use tokio::time::sleep;
 const BALANCE_PROXY_WALLET: &str = "0xD6d35B777089235c9CCDcD4830BF1BBda2A06300";
 
 fn default_polybot_binary() -> String {
-    if cfg!(target_os = "windows") {
-        "target\\release\\polymarket-bot.exe".to_string()
+    let candidates: &[&str] = if cfg!(target_os = "windows") {
+        &[
+            r"target\release-fast\polymarket-bot.exe",
+            r"target\release\polymarket-bot.exe",
+        ]
     } else {
-        "target/release/polymarket-bot".to_string()
+        &[
+            "target/release-fast/polymarket-bot",
+            "target/release/polymarket-bot",
+        ]
+    };
+    for c in candidates {
+        if Path::new(c).exists() {
+            return (*c).to_string();
+        }
     }
+    candidates[0].to_string()
 }
 
 fn default_polygon_rpc() -> String {
@@ -61,6 +73,37 @@ fn telegram_token() -> String {
 
 fn telegram_chat_id() -> String {
     std::env::var("TELEGRAM_CHAT_ID").unwrap_or_default()
+}
+
+/// True if an OS process with this PID exists (fallback when `Child` handle state is wrong).
+fn process_exists(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use std::process::Command as StdCommand;
+        let Ok(output) = StdCommand::new("tasklist")
+            .args(["/FI", &format!("PID eq {}", pid), "/FO", "CSV", "/NH"])
+            .output()
+        else {
+            return false;
+        };
+        let s = String::from_utf8_lossy(&output.stdout);
+        if s.contains("INFO: No tasks") {
+            return false;
+        }
+        s.contains(&format!("\"{}\"", pid))
+    }
+    #[cfg(not(windows))]
+    {
+        use std::process::Command as StdCommand;
+        StdCommand::new("/bin/sh")
+            .args(["-c", &format!("kill -0 {} 2>/dev/null", pid)])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
 }
 
 fn normalize_command(text: &str) -> String {
@@ -112,6 +155,8 @@ struct Supervisor {
     token: String,
     chat_id: String,
     bot_process: Option<Child>,
+    /// Set when we spawn the bot; used with `process_exists` if the `Child` handle disagrees.
+    tracked_bot_pid: Option<u32>,
     bot_started_at: Option<Instant>,
     strategy_db_path: String,
     bot_command: String,
@@ -131,6 +176,7 @@ impl Supervisor {
             token: telegram_token(),
             chat_id: telegram_chat_id(),
             bot_process: None,
+            tracked_bot_pid: None,
             bot_started_at: None,
             strategy_db_path: default_strategy_db(),
             bot_command,
@@ -177,6 +223,8 @@ impl Supervisor {
     }
 
     /// Returns true if a child is present and still running; clears state if it has exited.
+    /// On `try_wait` I/O errors we keep the handle and assume the child is still running — dropping
+    /// the handle would orphan the process and falsely report "not running" (seen on Windows).
     fn child_running(&mut self) -> bool {
         if let Some(ref mut ch) = self.bot_process {
             match ch.try_wait() {
@@ -184,14 +232,58 @@ impl Supervisor {
                 Ok(Some(_)) => {
                     self.bot_process = None;
                     self.bot_started_at = None;
+                    self.tracked_bot_pid = None;
                 }
-                Err(_) => {
-                    self.bot_process = None;
-                    self.bot_started_at = None;
+                Err(e) => {
+                    eprintln!(
+                        "supervisor: try_wait error (keeping child handle): {}",
+                        e
+                    );
+                    return true;
                 }
             }
         }
         false
+    }
+
+    /// Reconcile `Child` handle with OS process table (fixes false "not running" on some Windows setups).
+    fn refresh_bot_state(&mut self) -> (bool, u32, Option<Duration>) {
+        let running = self.child_running();
+        let pid_from_handle = self
+            .bot_process
+            .as_ref()
+            .and_then(|c| c.id())
+            .filter(|&id| id != 0);
+
+        if running {
+            if let Some(p) = pid_from_handle {
+                self.tracked_bot_pid = Some(p);
+            }
+            let pid = pid_from_handle.or(self.tracked_bot_pid).unwrap_or(0);
+            return (
+                true,
+                pid,
+                self.bot_started_at.map(|t| t.elapsed()),
+            );
+        }
+
+        if let Some(tp) = self.tracked_bot_pid {
+            if process_exists(tp) {
+                eprintln!(
+                    "supervisor: no live Child handle but PID {} exists (OS); reporting running",
+                    tp
+                );
+                return (
+                    true,
+                    tp,
+                    self.bot_started_at.map(|t| t.elapsed()),
+                );
+            }
+            self.tracked_bot_pid = None;
+            self.bot_started_at = None;
+        }
+
+        (false, 0, None)
     }
 
     async fn notify_if_child_exited(&mut self) {
@@ -200,6 +292,7 @@ impl Supervisor {
                 Ok(Some(status)) => {
                     self.bot_started_at = None;
                     self.bot_process = None;
+                    self.tracked_bot_pid = None;
                     let code = status.code();
                     self.send_message_with_retry(&format!(
                         "⚠️ Bot exited unexpectedly (exit code: {:?})",
@@ -208,7 +301,10 @@ impl Supervisor {
                     .await;
                 }
                 Ok(None) => {}
-                Err(e) => eprintln!("supervisor: try_wait error: {}", e),
+                Err(e) => eprintln!(
+                    "supervisor: try_wait error in notify_if_child_exited (ignored): {}",
+                    e
+                ),
             }
         }
     }
@@ -229,7 +325,7 @@ impl Supervisor {
 
     fn latest_session_pnl_line(&self) -> String {
         let path = &self.strategy_db_path;
-        if !PathBuf::from(path).exists() {
+        if !Path::new(path).exists() {
             return "No trading data yet.".to_string();
         }
         let sid = match query_latest_session_id(path) {
@@ -256,7 +352,7 @@ impl Supervisor {
 
     fn latest_session_stats_line(&self) -> String {
         let path = &self.strategy_db_path;
-        if !PathBuf::from(path).exists() {
+        if !Path::new(path).exists() {
             return "No trading data yet.".to_string();
         }
         let sid = match query_latest_session_id(path) {
@@ -324,13 +420,7 @@ impl Supervisor {
 
     async fn handle_command(&mut self, text: &str) -> String {
         let key = normalize_command(text);
-        let running = self.child_running();
-        let pid = self
-            .bot_process
-            .as_ref()
-            .and_then(|c| c.id())
-            .unwrap_or(0);
-        let uptime = self.bot_started_at.map(|t| t.elapsed());
+        let (running, pid, uptime) = self.refresh_bot_state();
 
         match key.as_str() {
             "/start" | "/startbot" => self.cmd_start_bot().await,
@@ -384,7 +474,7 @@ impl Supervisor {
     }
 
     async fn cmd_start_bot(&mut self) -> String {
-        if self.child_running() {
+        if self.refresh_bot_state().0 {
             return "⚠️ Bot is already running.".to_string();
         }
         let mut cmd = Command::new(&self.bot_command);
@@ -397,10 +487,11 @@ impl Supervisor {
             Err(e) => return format!("Failed to spawn bot: {}", e),
         };
         let pid = child.id().unwrap_or(0);
+        self.tracked_bot_pid = Some(pid);
         self.bot_process = Some(child);
         self.bot_started_at = Some(Instant::now());
         sleep(Duration::from_secs(3)).await;
-        if !self.child_running() {
+        if !self.refresh_bot_state().0 {
             return format!(
                 "⚠️ Bot crashed immediately after start (PID was {}). Check logs/.",
                 pid
@@ -410,15 +501,34 @@ impl Supervisor {
     }
 
     async fn cmd_stop_bot(&mut self) -> String {
-        if !self.child_running() {
+        if !self.refresh_bot_state().0 {
             return "⚠️ Bot is not running.".to_string();
         }
+        let kill_pid = self.tracked_bot_pid;
         if let Some(mut ch) = self.bot_process.take() {
             self.bot_started_at = None;
+            self.tracked_bot_pid = None;
             if let Err(e) = ch.kill().await {
                 return format!("Failed to stop bot: {}", e);
             }
             let _ = ch.wait().await;
+        } else if let Some(pid) = kill_pid {
+            self.bot_started_at = None;
+            self.tracked_bot_pid = None;
+            #[cfg(windows)]
+            {
+                let _ = Command::new("taskkill")
+                    .args(["/PID", &pid.to_string(), "/F", "/T"])
+                    .status()
+                    .await;
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = Command::new("/bin/kill")
+                    .args(["-TERM", &pid.to_string()])
+                    .status()
+                    .await;
+            }
         }
         "🔴 Bot stopped.".to_string()
     }
@@ -519,8 +629,12 @@ async fn main() {
             }
         };
 
+        // Process in update_id order so /startbot always runs before /dashboard in one batch.
+        let mut batch = upd.result;
+        batch.sort_by_key(|u| u.update_id);
+
         let mut max_id: i64 = -1;
-        for u in upd.result {
+        for u in batch {
             max_id = max_id.max(u.update_id);
             if seen.len() > SEEN_CAP {
                 seen.clear();
