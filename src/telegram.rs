@@ -14,8 +14,6 @@ use std::sync::{Arc, Mutex};
 use tokio::time::{sleep, Duration};
 use tracing::{error, warn};
 
-const DEFAULT_BOT_TOKEN: &str = "8669252052:AAFTJ9UeTTixZ2cOtfZ5ySXzBWoYWcs1hSE";
-const DEFAULT_CHAT_ID: &str = "5789011208";
 /// `/balance` command: fixed proxy wallet from project docs.
 const BALANCE_PROXY_WALLET: &str = "0xD6d35B777089235c9CCDcD4830BF1BBda2A06300";
 
@@ -43,17 +41,15 @@ struct TelegramReply {
 /// Bot token and chat id (same resolution as `TelegramBot::new`).
 pub fn telegram_auth_from_env() -> (String, String) {
     (
-        std::env::var("TELEGRAM_BOT_TOKEN").unwrap_or_else(|_| DEFAULT_BOT_TOKEN.to_string()),
-        std::env::var("TELEGRAM_CHAT_ID").unwrap_or_else(|_| DEFAULT_CHAT_ID.to_string()),
+        std::env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default(),
+        std::env::var("TELEGRAM_CHAT_ID").unwrap_or_default(),
     )
 }
 
 impl TelegramBot {
     pub fn new() -> Self {
-        let token = std::env::var("TELEGRAM_BOT_TOKEN")
-            .unwrap_or_else(|_| DEFAULT_BOT_TOKEN.to_string());
-        let chat_id = std::env::var("TELEGRAM_CHAT_ID")
-            .unwrap_or_else(|_| DEFAULT_CHAT_ID.to_string());
+        let token = std::env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default();
+        let chat_id = std::env::var("TELEGRAM_CHAT_ID").unwrap_or_default();
 
         let enabled = !token.trim().is_empty() && !chat_id.trim().is_empty();
 

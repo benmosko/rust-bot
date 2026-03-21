@@ -1,0 +1,28 @@
+#!/bin/sh
+# Block accidental commits of wallet keys and Telegram bot tokens (use .env / server env only).
+
+tmpfile=$(mktemp) || exit 1
+trap 'rm -f "$tmpfile"' EXIT INT HUP TERM
+git diff --cached --name-only --diff-filter=ACM >"$tmpfile" || exit 1
+
+while IFS= read -r f; do
+  [ -z "$f" ] && continue
+  case "$f" in
+    *.png|*.jpg|*.jpeg|*.gif|*.ico|*.woff|*.woff2|*.ttf|*.zip|*.gz|*.rlib|*.o)
+      continue ;;
+  esac
+  content=$(git show ":$f" 2>/dev/null) || continue
+  printf '%s\n' "$content" | grep -qE '(^|[^#[:alnum:]_])POLYMARKET_PRIVATE_KEY[[:space:]]*=[[:space:]]*0x[a-fA-F0-9]{64}([[:space:]]|$)' && {
+    echo "pre-commit: refuse: $f has POLYMARKET_PRIVATE_KEY with a full 0x key. Keep it in .env (gitignored) or the process environment." >&2
+    exit 1
+  }
+  printf '%s\n' "$content" | grep -qE '(^|[^#[:alnum:]_])PK[[:space:]]*=[[:space:]]*0x[a-fA-F0-9]{64}([[:space:]]|$)' && {
+    echo "pre-commit: refuse: $f has PK= with a full 0x key. Use .env or environment variables only." >&2
+    exit 1
+  }
+  printf '%s\n' "$content" | grep -qE '(^|[^#[:alnum:]_])TELEGRAM_BOT_TOKEN[[:space:]]*=[[:space:]]*[0-9]{6,14}:[A-Za-z0-9_-]{25,}' && {
+    echo "pre-commit: refuse: $f assigns TELEGRAM_BOT_TOKEN to a real-looking token. Use .env (gitignored) or the server environment." >&2
+    exit 1
+  }
+done <"$tmpfile"
+exit 0
