@@ -679,23 +679,14 @@ fn finalize_open_round_resolution(
     );
 }
 
-/// Backoff for Gamma polling: **1s** for the first minute after `round_end`, then relaxes.
-fn gamma_poll_interval_secs(round_start: i64, period: Period) -> u64 {
-    let round_end = round_start + period.as_seconds();
-    let now = Utc::now().timestamp();
-    let after_end = now.saturating_sub(round_end);
-    if after_end < 60 {
-        1
-    } else if after_end < 600 {
-        5
-    } else {
-        20
-    }
+/// Fixed **3s** between Gamma polls from `round_end` until resolved (simple backoff).
+fn gamma_poll_interval_secs(_round_start: i64, _period: Period) -> u64 {
+    3
 }
 
 /// Settle OPEN rows from **Gamma only** (same source as the app: `outcomePrices` + `closed`).
 /// Finalizes as soon as [`infer_up_won_from_prices_and_labels`] returns `Some` — often **before** `closed=true`.
-/// [`gamma_poll_interval_secs`] polls every **1s** in the first **60s** after `round_end` to catch flips quickly.
+/// [`gamma_poll_interval_secs`] polls every **3s** after `round_end` until outcome prices are decisive.
 pub async fn resolve_round_history_open_entries_chainlink_or_gamma(
     tracker: Option<Arc<ChainlinkTracker>>,
     client: &reqwest::Client,
@@ -805,7 +796,7 @@ pub async fn resolve_round_history_open_entries_chainlink_or_gamma(
 }
 
 /// Poll Gamma until outcome prices are decisive (see [`infer_up_won_from_prices_and_labels`]).
-/// Interval: 1s for 60s after `round_end`, then 5s / 20s (see [`gamma_poll_interval_secs`]).
+/// Interval: **3s** (see [`gamma_poll_interval_secs`]).
 /// Stops on `shutdown` or once all matching OPEN rows are settled.
 pub async fn resolve_round_history_open_entries_gamma(
     client: &reqwest::Client,
