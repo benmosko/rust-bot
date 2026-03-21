@@ -713,6 +713,21 @@ fn try_chainlink_finalize_open_round(
     true
 }
 
+/// Backoff for Gamma-only polling: aggressive right after `round_end` (official `closed` often appears
+/// within 1–3 minutes; we want to notice it as soon as Polymarket’s API reflects it).
+fn gamma_poll_interval_secs(round_start: i64, period: Period) -> u64 {
+    let round_end = round_start + period.as_seconds();
+    let now = Utc::now().timestamp();
+    let after_end = now.saturating_sub(round_end);
+    if after_end < 120 {
+        3
+    } else if after_end < 600 {
+        10
+    } else {
+        30
+    }
+}
+
 /// Prefer Polymarket Gamma (official settlement) when `closed` + winner is known; else Chainlink RTDS
 /// when Gamma lags (`closed=false` or ambiguous prices); else poll Gamma.
 pub async fn resolve_round_history_open_entries_chainlink_or_gamma(
@@ -896,7 +911,8 @@ pub async fn resolve_round_history_open_entries_chainlink_or_gamma(
 }
 
 /// Poll Gamma until the market is resolved (`closed` + `outcomePrices`), then set OPEN rows to WON/LOST.
-/// Retries every 15s; stops on `shutdown` or once all matching OPEN rows are settled.
+/// Interval starts at 3s after `round_end`, then 10s, then 30s (see [`gamma_poll_interval_secs`]).
+/// Stops on `shutdown` or once all matching OPEN rows are settled.
 pub async fn resolve_round_history_open_entries_gamma(
     client: &reqwest::Client,
     round_history: &Arc<Mutex<Vec<RoundHistoryEntry>>>,
@@ -980,14 +996,14 @@ pub async fn resolve_round_history_open_entries_gamma(
                     condition_id = %condition_id,
                     slug = %slug,
                     closed = res.closed,
-                    "Gamma market not fully resolved yet; retry in 15s"
+                    "Gamma market not fully resolved yet"
                 );
             }
             Ok(None) => {
                 debug!(
                     condition_id = %condition_id,
                     slug = %slug,
-                    "Gamma markets: empty response; retry in 15s"
+                    "Gamma markets: empty response"
                 );
             }
             Err(e) => {
@@ -995,14 +1011,21 @@ pub async fn resolve_round_history_open_entries_gamma(
                     error = %e,
                     condition_id = %condition_id,
                     slug = %slug,
-                    "Gamma resolution fetch error; retry in 15s"
+                    "Gamma resolution fetch error"
                 );
             }
         }
 
+        let wait = gamma_poll_interval_secs(round_start, period);
+        debug!(
+            condition_id = %condition_id,
+            slug = %slug,
+            wait_secs = wait,
+            "Gamma resolution: sleep before next poll"
+        );
         tokio::select! {
             _ = shutdown.cancelled() => return,
-            _ = sleep(Duration::from_secs(15)) => {}
+            _ = sleep(Duration::from_secs(wait)) => {}
         }
     }
 }
