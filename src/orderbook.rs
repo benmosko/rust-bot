@@ -91,6 +91,12 @@ impl OrderbookManager {
         if let Some(orderbook) = self.orderbooks.get(token_id) {
             if let Some(best_ask) = orderbook.best_ask() {
                 if best_ask >= threshold {
+                    debug!(
+                        token_id = %token_id,
+                        best_ask = %best_ask,
+                        threshold = %threshold,
+                        "Emitting price threshold event (best_ask >= sniper entry min)"
+                    );
                     let event = PriceThresholdEvent {
                         token_id: token_id.to_string(),
                         best_ask,
@@ -141,7 +147,8 @@ impl OrderbookManager {
             timestamp: chrono::Utc::now(),
         };
 
-        self.orderbooks.insert(token_id, state);
+        self.orderbooks.insert(token_id.clone(), state);
+        self.check_and_emit_price_threshold(&token_id);
     }
 
     fn parse_asset_id(token_id: &str) -> Result<U256> {

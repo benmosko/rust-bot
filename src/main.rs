@@ -565,95 +565,7 @@ async fn main() -> Result<()> {
         let now = Utc::now().timestamp();
         debug!(timestamp = now, "Main loop tick");
 
-        // Phase 1: push TUI updates for every configured slot first. Sequential Gamma fetches used to
-        // block the whole loop; one slow market froze prices for all others.
-        // Same snapshot feeds the Telegram Mini App dashboard (`live_dashboard_rounds`).
-        let mut live_rows: Vec<LiveRoundRow> = Vec::with_capacity(market_slots.len());
-        for &(coin, period) in &market_slots {
-            let period_secs = period.as_seconds();
-            let round_start = (now / period_secs) * period_secs;
-            let round_end = round_start + period_secs;
-            let elapsed_pct = (now - round_start) as f64 / period_secs as f64;
-            let round_key = (coin, period, round_start);
-
-            let (yes_price, no_price, strategy_str) = if let Some(round) = active_rounds.get(&round_key) {
-                let (yes, no) = round_yes_no_display_prices(&orderbook_for_tui, &round.market);
-                let mut active_strategy = "—".to_string();
-                let strategy_order = if config.strategy_mode == polymarket_bot::config::StrategyMode::SniperOnly {
-                    vec!["sniper"]
-                } else {
-                    vec!["spread_capture", "momentum", "market_maker", "sniper"]
-                };
-
-                for strategy_name in &strategy_order {
-                    let key = strategy_status_key(coin, period, round_start, strategy_name);
-                    if let Some(status) = strategy_status_for_tui.get(&key) {
-                        let status_val = status.value().clone();
-                        if strategy_name == &"sniper" || (status_val != "Ended" && status_val != "Waiting") {
-                            if strategy_name == &"sniper" {
-                                active_strategy = status_val.clone();
-                            } else {
-                                active_strategy = format!(
-                                    "{}: {}",
-                                    match *strategy_name {
-                                        "spread_capture" => "Gab",
-                                        "momentum" => "Mom",
-                                        "market_maker" => "MM",
-                                        "sniper" => "Snp",
-                                        _ => "",
-                                    },
-                                    status_val
-                                );
-                            }
-                            break;
-                        }
-                    }
-                }
-                (yes, no, active_strategy)
-            } else {
-                (rust_decimal::Decimal::ZERO, rust_decimal::Decimal::ZERO, "Waiting".to_string())
-            };
-
-            let status_str = if now >= round_end {
-                "Ended".to_string()
-            } else if active_rounds.contains_key(&round_key) {
-                "Active".to_string()
-            } else {
-                "Waiting".to_string()
-            };
-
-            live_rows.push(LiveRoundRow {
-                coin: coin.as_str().to_uppercase(),
-                period: format!("{}m", period.as_minutes()),
-                market_label: format!("{} {}m", coin.as_str().to_uppercase(), period.as_minutes()),
-                round_start,
-                round_end,
-                round_time_range_utc: format_round_time_range_utc(round_start, round_end),
-                elapsed_pct,
-                yes_ask: yes_price.to_f64().unwrap_or(0.0),
-                no_ask: no_price.to_f64().unwrap_or(0.0),
-                strategy: abbrev_strategy_line(&strategy_str),
-                status: status_str.clone(),
-            });
-
-            if let Some(ref tui_tx) = tui_tx_rounds {
-                let _ = tui_tx.try_send(TuiEvent::RoundUpdate {
-                    coin,
-                    period,
-                    round_start,
-                    elapsed_pct,
-                    yes_price,
-                    no_price,
-                    strategy: strategy_str,
-                    status: status_str,
-                });
-            }
-        }
-        if let Ok(mut g) = live_dashboard_rounds.lock() {
-            *g = live_rows;
-        }
-
-        // Phase 2: parallel Gamma discovery for slots missing the current round
+        // Phase 2: parallel Gamma discovery FIRST (snipers + orderbooks before TUI/dashboard pass)
         let mut fetch_jobs: Vec<((Coin, Period, i64), i64)> = Vec::new();
         for &(coin, period) in &market_slots {
             let period_secs = period.as_seconds();
@@ -715,12 +627,26 @@ async fn main() -> Result<()> {
                         };
 
                         active_rounds.insert(round_key, round.clone());
+
+                        let spot_receiver_opt = spot_feeds.get(&coin).cloned();
+                        let opening_price_for_chainlink = spot_receiver_opt.as_ref().and_then(|rx| {
+                            let spot_state = rx.borrow();
+                            spot_state.opening_price.or_else(|| {
+                                if spot_state.price > Decimal::ZERO {
+                                    Some(spot_state.price)
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                        .or(market.opening_price);
+
                         chainlink_tracker.register_round(
                             coin,
                             period,
                             round_start,
                             market.round_end,
-                            market.opening_price,
+                            opening_price_for_chainlink,
                         );
 
                         orderbook.initialize_orderbook(
@@ -737,7 +663,6 @@ async fn main() -> Result<()> {
                         orderbook.subscribe(market.up_token_id.clone())?;
                         orderbook.subscribe(market.down_token_id.clone())?;
 
-                        let spot_receiver_opt = spot_feeds.get(&coin).cloned();
                         if let Some(spot_receiver) = spot_receiver_opt {
                             let spot_state = spot_receiver.borrow().clone();
                             let opening_price = spot_state.opening_price.unwrap_or(spot_state.price);
@@ -1023,6 +948,92 @@ async fn main() -> Result<()> {
             }
         }
 
+        // Phase 1: push TUI updates for every configured slot (after discovery this iteration).
+        let mut live_rows: Vec<LiveRoundRow> = Vec::with_capacity(market_slots.len());
+        for &(coin, period) in &market_slots {
+            let period_secs = period.as_seconds();
+            let round_start = (now / period_secs) * period_secs;
+            let round_end = round_start + period_secs;
+            let elapsed_pct = (now - round_start) as f64 / period_secs as f64;
+            let round_key = (coin, period, round_start);
+
+            let (yes_price, no_price, strategy_str) = if let Some(round) = active_rounds.get(&round_key) {
+                let (yes, no) = round_yes_no_display_prices(&orderbook_for_tui, &round.market);
+                let mut active_strategy = "—".to_string();
+                let strategy_order = if config.strategy_mode == polymarket_bot::config::StrategyMode::SniperOnly {
+                    vec!["sniper"]
+                } else {
+                    vec!["spread_capture", "momentum", "market_maker", "sniper"]
+                };
+
+                for strategy_name in &strategy_order {
+                    let key = strategy_status_key(coin, period, round_start, strategy_name);
+                    if let Some(status) = strategy_status_for_tui.get(&key) {
+                        let status_val = status.value().clone();
+                        if strategy_name == &"sniper" || (status_val != "Ended" && status_val != "Waiting") {
+                            if strategy_name == &"sniper" {
+                                active_strategy = status_val.clone();
+                            } else {
+                                active_strategy = format!(
+                                    "{}: {}",
+                                    match *strategy_name {
+                                        "spread_capture" => "Gab",
+                                        "momentum" => "Mom",
+                                        "market_maker" => "MM",
+                                        "sniper" => "Snp",
+                                        _ => "",
+                                    },
+                                    status_val
+                                );
+                            }
+                            break;
+                        }
+                    }
+                }
+                (yes, no, active_strategy)
+            } else {
+                (rust_decimal::Decimal::ZERO, rust_decimal::Decimal::ZERO, "Waiting".to_string())
+            };
+
+            let status_str = if now >= round_end {
+                "Ended".to_string()
+            } else if active_rounds.contains_key(&round_key) {
+                "Active".to_string()
+            } else {
+                "Waiting".to_string()
+            };
+
+            live_rows.push(LiveRoundRow {
+                coin: coin.as_str().to_uppercase(),
+                period: format!("{}m", period.as_minutes()),
+                market_label: format!("{} {}m", coin.as_str().to_uppercase(), period.as_minutes()),
+                round_start,
+                round_end,
+                round_time_range_utc: format_round_time_range_utc(round_start, round_end),
+                elapsed_pct,
+                yes_ask: yes_price.to_f64().unwrap_or(0.0),
+                no_ask: no_price.to_f64().unwrap_or(0.0),
+                strategy: abbrev_strategy_line(&strategy_str),
+                status: status_str.clone(),
+            });
+
+            if let Some(ref tui_tx) = tui_tx_rounds {
+                let _ = tui_tx.try_send(TuiEvent::RoundUpdate {
+                    coin,
+                    period,
+                    round_start,
+                    elapsed_pct,
+                    yes_price,
+                    no_price,
+                    strategy: strategy_str,
+                    status: status_str,
+                });
+            }
+        }
+        if let Ok(mut g) = live_dashboard_rounds.lock() {
+            *g = live_rows;
+        }
+
         // Phase 3: pre-fetch next round + expire old rounds
         for &(coin, period) in &market_slots {
             let period_secs = period.as_seconds();
@@ -1077,7 +1088,7 @@ async fn main() -> Result<()> {
             // The current round runs (round_start, round_end); the previous round ran (round_start - period_secs, round_start).
             let round_to_cleanup_start = round_start - period_secs;
             let round_key_cleanup = (coin, period, round_to_cleanup_start);
-            if now > round_start + 60 {
+            if now > round_start + 3 {
                 info!(
                     round_key = ?round_key_cleanup,
                     "Round cleanup triggered for round_key"

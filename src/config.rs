@@ -67,6 +67,8 @@ pub struct Config {
     pub sniper_entry_window_5m: u64,
     /// Seconds before round end when sniper may activate for rounds longer than 5 minutes.
     pub sniper_entry_window_15m: u64,
+    /// Minimum interval between sniper entry gate evaluations while in the entry window (timer + price events).
+    pub sniper_eval_interval_ms: u64,
     /// If true, when Polymarket **best_ask** on a leg is ≥ [`sniper_entry_min_best_ask`] but Binance spot is still
     /// within a small **relative** distance of the round's Binance start (`opening_price` in sniper), skip until
     /// CEX has moved enough (avoids buying a "hot" PM leg while spot is still flat vs round open).
@@ -299,6 +301,11 @@ impl Config {
             .parse::<u64>()
             .context("SNIPER_ENTRY_WINDOW_15M must be a positive integer (seconds)")?;
 
+        let sniper_eval_interval_ms = env::var("SNIPER_EVAL_INTERVAL_MS")
+            .unwrap_or_else(|_| "100".to_string())
+            .parse::<u64>()
+            .context("SNIPER_EVAL_INTERVAL_MS must be a positive integer (milliseconds)")?;
+
         let sniper_min_distance_from_open_filter = env::var("SNIPER_MIN_DISTANCE_FROM_OPEN_FILTER")
             .unwrap_or_else(|_| "false".to_string())
             .parse::<bool>()
@@ -426,6 +433,7 @@ impl Config {
             sniper_max_fills_per_round,
             sniper_entry_window_5m,
             sniper_entry_window_15m,
+            sniper_eval_interval_ms,
             sniper_min_distance_from_open_filter,
             sniper_momentum_reversal_filter,
             sniper_slope_filter,

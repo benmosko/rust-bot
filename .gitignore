@@ -32,3 +32,9 @@ state.json
 
 # Local Gamma API dumps / debugging
 gamma_*.json
+
+# One-off analysis / investigation scripts (kept locally, not versioned)
+research/
+
+# Local SQLite databases
+*.db

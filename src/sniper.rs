@@ -635,19 +635,14 @@ impl Sniper {
             tick_spot,
         ));
 
-        // Fallback polling interval (safety net in case events are missed)
-        let mut fallback_interval = tokio::time::interval(Duration::from_millis(100));
-        fallback_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let eval_ms = self.config.sniper_eval_interval_ms.max(10);
+        let mut eval_interval = tokio::time::interval(Duration::from_millis(eval_ms));
+        eval_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         let sniper_run_start = Instant::now();
-        let mut heartbeat_interval = tokio::time::interval_at(
-            tokio::time::Instant::now() + Duration::from_secs(30),
-            Duration::from_secs(30),
-        );
-        heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        // Last time we started `evaluate_entry_gates_with_orderbooks` (detect long gaps when stuck in poll / HTTP).
-        let mut last_gate_eval_at: Option<Instant> = None;
+        let mut last_eval_at: Option<Instant> = None;
+        let mut eval_count_10s: u64 = 0;
+        let mut rate_window_start = Instant::now();
 
         loop {
             if shutdown.is_cancelled() {
@@ -684,6 +679,15 @@ impl Sniper {
                 continue;
             }
 
+            if last_eval_at.is_none() {
+                info!(
+                    market = %self.market.slug,
+                    time_remaining_secs = time_remaining,
+                    entry_window_secs,
+                    "Sniper entry window active — evaluation loop starting"
+                );
+            }
+
             // Check if sniper is paused
             if self.risk.is_sniper_paused().await {
                 self.strategy_status.insert(status_key.clone(), "Snp: Paused".to_string());
@@ -706,42 +710,16 @@ impl Sniper {
                 continue;
             }
 
-            // EVENT-DRIVEN TRIGGER: Wait for price threshold event OR fallback timer
-            // This gives us sub-2ms detection latency when prices cross the entry threshold
+            // Wake on eval timer (guaranteed) or price threshold event (fast path). Always evaluate below.
             let mut threshold_emit_at: Option<Instant> = None;
-            let mut skip_entry_gates_this_iteration = false;
             tokio::select! {
-                biased;
                 _ = shutdown.cancelled() => {
                     break;
                 }
-                _ = heartbeat_interval.tick() => {
-                    let elapsed = sniper_run_start.elapsed().as_secs();
-                    let best_ask_yes = self
-                        .orderbook
-                        .get_orderbook(&self.market.up_token_id)
-                        .and_then(|o| o.best_ask());
-                    let best_ask_no = self
-                        .orderbook
-                        .get_orderbook(&self.market.down_token_id)
-                        .and_then(|o| o.best_ask());
-                    info!(
-                        market = %self.market.slug,
-                        elapsed_secs = elapsed,
-                        best_ask_yes = ?best_ask_yes,
-                        best_ask_no = ?best_ask_no,
-                        "Sniper heartbeat"
-                    );
-                    skip_entry_gates_this_iteration = true;
-                }
-                // Primary trigger: Price threshold event (best_ask >= sniper entry minimum)
+                _ = eval_interval.tick() => {}
                 event_result = price_event_rx.recv() => {
                     match event_result {
                         Ok(event) => {
-                            // Shared broadcast: every subscribed sniper receives threshold events for ALL tokens.
-                            // Only record hot-path latency when the event is for our market; still run entry
-                            // gates below so other markets' events do not starve us (biased select + continue
-                            // would skip evaluate_entry_gates until our token happened to fire).
                             if event.token_id == self.market.up_token_id || event.token_id == self.market.down_token_id {
                                 threshold_emit_at = Some(event.timestamp);
                                 let event_latency = event.timestamp.elapsed();
@@ -750,7 +728,7 @@ impl Sniper {
                                     token_id = %event.token_id,
                                     best_ask = %event.best_ask,
                                     event_latency_us = event_latency.as_micros(),
-                                    "Price threshold event received - triggering entry check"
+                                    "Price threshold event received"
                                 );
                             } else {
                                 debug!(
@@ -760,20 +738,68 @@ impl Sniper {
                                 );
                             }
                         }
-                        Err(RecvError::Lagged(_)) => {
-                            // Dropped messages; orderbook state is still updated on WS path — evaluate gates.
+                        Err(RecvError::Lagged(n)) => {
+                            debug!(
+                                market = %self.market.slug,
+                                lagged = n,
+                                "price_events broadcast lagged; orderbook state still updated on WS path"
+                            );
                         }
                         Err(RecvError::Closed) => {
+                            warn!(
+                                market = %self.market.slug,
+                                "price_events channel closed; continuing on eval timer only"
+                            );
                             self.log_sniper_decision("price_events_channel_closed", None, None);
-                            skip_entry_gates_this_iteration = true;
                         }
                     }
                 }
-                // Fallback: Safety timer (100ms) ensures we don't miss events
-                _ = fallback_interval.tick() => {
-                    // Fallback tick, check entry gates
+            }
+
+            let now_gate = Instant::now();
+            if let Some(prev) = last_eval_at {
+                let gap = now_gate.saturating_duration_since(prev);
+                if gap > Duration::from_millis(500) {
+                    warn!(
+                        market = %self.market.slug,
+                        gap_ms = gap.as_millis(),
+                        "Sniper evaluation gap detected"
+                    );
                 }
-            };
+            }
+            last_eval_at = Some(now_gate);
+
+            eval_count_10s += 1;
+            let win_dur = rate_window_start.elapsed();
+            if win_dur >= Duration::from_secs(10) {
+                let eps = eval_count_10s as f64 / win_dur.as_secs_f64().max(0.01);
+                let best_ask_yes = self
+                    .orderbook
+                    .get_orderbook(&self.market.up_token_id)
+                    .and_then(|o| o.best_ask());
+                let best_ask_no = self
+                    .orderbook
+                    .get_orderbook(&self.market.down_token_id)
+                    .and_then(|o| o.best_ask());
+                info!(
+                    market = %self.market.slug,
+                    elapsed_secs = sniper_run_start.elapsed().as_secs(),
+                    eval_per_sec = eps,
+                    evals_in_window = eval_count_10s,
+                    best_ask_yes = ?best_ask_yes,
+                    best_ask_no = ?best_ask_no,
+                    "Sniper heartbeat (eval rate)"
+                );
+                if eps < 5.0 {
+                    warn!(
+                        market = %self.market.slug,
+                        eval_per_sec = eps,
+                        "Sniper eval rate below 5/sec during entry window — check blocking / poll loop"
+                    );
+                }
+                eval_count_10s = 0;
+                rate_window_start = Instant::now();
+            }
 
             // Primary fill cap for this market (coin, period, round_start): stop new sniper GTCs.
             let filled_count_outer = self.gtc_filled_count.load(Ordering::Relaxed);
@@ -796,24 +822,7 @@ impl Sniper {
                 continue;
             }
 
-            if skip_entry_gates_this_iteration {
-                continue;
-            }
-
-            let now_eval = Instant::now();
-            if let Some(prev) = last_gate_eval_at {
-                let gap = now_eval.saturating_duration_since(prev);
-                if gap > Duration::from_secs(1) {
-                    warn!(
-                        market = %self.market.slug,
-                        gap_ms = gap.as_millis(),
-                        "sniper evaluation cycle gap > 1s since last gate eval (common: inner poll loop after GTC place — fallback_interval/select! not running; or slow CLOB/reconcile)"
-                    );
-                }
-            }
-            last_gate_eval_at = Some(now_eval);
-
-            // Run entry gates (triggered by event or fallback timer)
+            // Run entry gates every iteration (timer + optional price event)
             let t0 = Instant::now(); // Start: entry conditions detected
             let emit_to_hot_us: Option<u128> = threshold_emit_at
                 .map(|emit| emit.elapsed().as_micros());
@@ -1352,13 +1361,15 @@ impl Sniper {
                     active_legs = placed;
                     self.strategy_status.insert(status_key.clone(), "Snp: Live".to_string());
 
-                    // Does not return to `tokio::select!` above until this loop exits — `fallback_interval`
-                    // and price-event wakeups do not apply while polling resting GTC status.
+                    // Does not return to the outer `select!` until this loop exits — no timer-driven gate
+                    // eval until we exit (mitigated by periodic best-ask check below).
+                    let mut poll_iter: u64 = 0;
                     'poll: loop {
                         if shutdown.is_cancelled() {
                             break 'poll;
                         }
 
+                        poll_iter = poll_iter.wrapping_add(1);
                         let poll_iter_start = Instant::now();
                         let now = Utc::now().timestamp();
                         let tr = self.market.round_end - now;
@@ -1624,6 +1635,34 @@ impl Sniper {
                                 }
                                 active_legs.clear();
                                 break 'poll;
+                            }
+                        }
+
+                        if poll_iter % 5 == 0 {
+                            let yes_ob = self.orderbook.get_orderbook(&self.market.up_token_id);
+                            let no_ob = self.orderbook.get_orderbook(&self.market.down_token_id);
+                            match self
+                                .evaluate_entry_gates_with_orderbooks(yes_ob, no_ob, None)
+                                .await
+                            {
+                                Ok(Some(sides)) if !sides.is_empty() => {
+                                    for leg in &active_legs {
+                                        for (side_name, _tid, best_ask) in &sides {
+                                            if *side_name == leg.side_name
+                                                && *best_ask > leg.maker_price + dec!(0.02)
+                                            {
+                                                info!(
+                                                    market = %self.market.slug,
+                                                    side = %leg.side_name,
+                                                    maker_price = %leg.maker_price,
+                                                    current_best_ask = %best_ask,
+                                                    "Better price available vs resting GTC (consider cancel/replace)"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
                             }
                         }
 

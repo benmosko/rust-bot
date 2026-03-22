@@ -522,7 +522,7 @@ pub async fn fetch_market_resolution_by_slug(
     Ok(Some(GammaMarketResolution { closed, up_won }))
 }
 
-/// Chainlink-style resolution: UP / DOWN / tie (no movement). Gamma only gives a binary winner.
+/// Chainlink-style resolution: UP vs DOWN from open/close. Gamma fallback only gives a binary winner.
 fn apply_chainlink_outcome_to_open_round_history(
     round_history: &Arc<Mutex<Vec<RoundHistoryEntry>>>,
     condition_id: &str,
@@ -551,7 +551,6 @@ fn apply_chainlink_outcome_to_open_round_history(
         let won = match outcome {
             ChainlinkOutcome::UpWon => e.side_label == "UP",
             ChainlinkOutcome::DownWon => e.side_label == "DOWN",
-            ChainlinkOutcome::Tie => false,
         };
         // Explicit realized P&L for unhedged legs (must match TUI session sum).
         let pnl = if won {
@@ -573,13 +572,7 @@ fn apply_chainlink_outcome_to_open_round_history(
             e.status,
             e.pnl,
         );
-        let position_outcome = if matches!(outcome, ChainlinkOutcome::Tie) {
-            "TIE"
-        } else if won {
-            "WON"
-        } else {
-            "LOST"
-        };
+        let position_outcome = if won { "WON" } else { "LOST" };
         let entry_pf = e.entry_price.to_f64().unwrap_or(0.0);
         let time_left_u = (e.round_end - e.fill_time.timestamp()).max(0) as u64;
         let pnl_f = pnl.to_f64().unwrap_or(0.0);
@@ -672,13 +665,10 @@ fn finalize_open_round_resolution(
             }
             let position_outcome = if e.status == RoundHistoryStatus::Hedged {
                 "HEDGED"
-            } else if matches!(outcome, ChainlinkOutcome::Tie) {
-                "TIE"
             } else {
                 let matches_winning_side = match outcome {
                     ChainlinkOutcome::UpWon => e.side_label == "UP",
                     ChainlinkOutcome::DownWon => e.side_label == "DOWN",
-                    ChainlinkOutcome::Tie => unreachable!(),
                 };
                 if matches_winning_side {
                     "WON"
@@ -742,9 +732,8 @@ fn gamma_poll_interval_secs(_round_start: i64, _period: Period) -> u64 {
     3
 }
 
-/// Settle OPEN rows from **Gamma** (`outcomePrices` + `closed`). Winner comes only from Gamma; the
-/// Chainlink tracker (if passed) is still used for open/close **prices** in logs/Telegram after finalize.
-/// [`gamma_poll_interval_secs`] polls every **3s** until outcome prices are decisive.
+/// Prefer **Chainlink** open (Gamma `opening_price` + RTDS close) vs Gamma `outcomePrices` polling.
+/// [`resolve_round_history_open_entries_gamma`] polls every **3s** only when Chainlink cannot resolve.
 pub async fn resolve_round_history_open_entries_chainlink_or_gamma(
     tracker: Option<Arc<ChainlinkTracker>>,
     client: &reqwest::Client,
@@ -779,61 +768,37 @@ pub async fn resolve_round_history_open_entries_chainlink_or_gamma(
         return;
     }
 
-    match fetch_market_resolution_by_slug(client, slug).await {
-        Ok(Some(gamma_res)) => {
-            if let Some(up_won) = gamma_res.up_won {
-                info!(
-                    slug = %slug,
-                    closed = gamma_res.closed,
-                    up_won,
-                    "Gamma: decisive outcomePrices (finalize; closed flag may still lag)"
-                );
-                let outcome = if up_won {
-                    ChainlinkOutcome::UpWon
-                } else {
-                    ChainlinkOutcome::DownWon
-                };
-                finalize_open_round_resolution(
-                    outcome,
-                    tracker.as_ref(),
-                    round_history,
-                    coin,
-                    period,
-                    round_start,
-                    condition_id,
-                    slug,
-                    &strategy_logger,
-                    &spot_feeds,
-                    &telegram,
-                    "gamma",
-                );
-                return;
-            }
-            resolve_round_history_open_entries_gamma(
-                client,
-                round_history,
-                condition_id,
-                slug,
+    if let Some(ref t) = tracker {
+        if let Some(outcome) = t.try_resolve_outcome(coin, period, round_start) {
+            info!(
+                coin = ?coin,
+                period = ?period,
                 round_start,
-                shutdown,
-                tracker,
+                ?outcome,
+                "Using Chainlink resolution (primary)"
+            );
+            finalize_open_round_resolution(
+                outcome,
+                Some(t),
+                round_history,
                 coin,
                 period,
-                strategy_logger,
-                spot_feeds,
-                telegram,
-            )
-            .await;
+                round_start,
+                condition_id,
+                slug,
+                &strategy_logger,
+                &spot_feeds,
+                &telegram,
+                "chainlink",
+            );
             return;
         }
-        Err(e) => {
-            warn!(
-                error = %e,
-                slug = %slug,
-                "Gamma resolution fetch failed; polling Gamma"
-            );
-        }
-        Ok(None) => {}
+        warn!(
+            coin = ?coin,
+            period = ?period,
+            round_start,
+            "Chainlink resolution unavailable (missing open or close, or round not ended) — falling back to Gamma"
+        );
     }
 
     resolve_round_history_open_entries_gamma(

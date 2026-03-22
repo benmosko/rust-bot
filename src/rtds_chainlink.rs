@@ -41,8 +41,6 @@ pub enum ChainlinkOutcome {
     UpWon,
     /// `close_price < open_price` (price moved down).
     DownWon,
-    /// `close_price == open_price` (no movement; neither UP nor DOWN wins).
-    Tie,
 }
 
 #[derive(Debug, Clone)]
@@ -120,8 +118,8 @@ impl ChainlinkTracker {
     /// at/after `round_start`, taken from the rolling buffer when available so late registration
     /// still sees the correct open.
     ///
-    /// `api_opening_price` is the Polymarket/Gamma-reported open when the buffer only has ticks
-    /// from after the bot connected (mid-round start).
+    /// `api_opening_price` is Gamma's Chainlink open at round start (same as settlement); used when
+    /// the rolling buffer has no boundary tick (e.g. bot started mid-round).
     pub fn register_round(
         &self,
         coin: Coin,
@@ -135,31 +133,33 @@ impl ChainlinkTracker {
             Some((tick_ts, price)) if (tick_ts - round_start).abs() <= 2 => {
                 (Some(*price), Some(ChainlinkOpenSource::Buffer))
             }
-            Some(_) => {
+            _ => {
                 if let Some(api) = api_opening_price {
+                    info!(
+                        coin = ?coin,
+                        period = ?period,
+                        round_start,
+                        price = %api,
+                        "Using Gamma opening_price (bot started mid-round)"
+                    );
                     (Some(api), Some(ChainlinkOpenSource::ApiFallback))
                 } else {
-                    (
-                        buffer_ts_price.map(|(_, p)| p),
-                        Some(ChainlinkOpenSource::StaleBuffer),
-                    )
-                }
-            }
-            None => {
-                if let Some(api) = api_opening_price {
-                    (Some(api), Some(ChainlinkOpenSource::ApiFallback))
-                } else {
+                    warn!(
+                        coin = ?coin,
+                        period = ?period,
+                        round_start,
+                        "No opening price available — Chainlink resolution may fail for this round"
+                    );
                     (None, None)
                 }
             }
         };
 
-        let source_tag = match (&buffer_ts_price, api_opening_price.is_some()) {
-            (Some((tick_ts, _)), _) if (tick_ts - round_start).abs() <= 2 => "buffer",
-            (Some(_), true) => "api_fallback",
-            (Some(_), false) => "stale_buffer_fallback",
-            (None, true) => "api_fallback",
-            (None, false) => "none",
+        let source_tag = match &open_source {
+            Some(ChainlinkOpenSource::Buffer) => "buffer",
+            Some(ChainlinkOpenSource::ApiFallback) => "api_fallback",
+            Some(ChainlinkOpenSource::StaleBuffer) => "stale_buffer",
+            None => "none",
         };
 
         self.rounds.insert(
@@ -332,7 +332,7 @@ impl ChainlinkTracker {
     /// Falls back to `lookup_first_ge` on the rolling buffer only when a boundary was missed
     /// (e.g. bot started mid-round). Buffer alone at resolution time is unreliable (rotation).
     ///
-    /// Rules: UP wins iff `close > open`; DOWN wins iff `close < open`; if equal, neither wins.
+    /// Rules: UP wins iff `close >= open` (ties go to UP); DOWN wins iff `close < open`.
     /// Returns `None` if data is missing or round not finished (caller falls back to Gamma).
     pub fn try_resolve_outcome(
         &self,
@@ -390,9 +390,8 @@ impl ChainlinkTracker {
         };
 
         let outcome = match close.cmp(&open) {
-            Ordering::Greater => ChainlinkOutcome::UpWon,
+            Ordering::Greater | Ordering::Equal => ChainlinkOutcome::UpWon,
             Ordering::Less => ChainlinkOutcome::DownWon,
-            Ordering::Equal => ChainlinkOutcome::Tie,
         };
         info!(
             coin = ?coin,
@@ -641,7 +640,7 @@ mod tests {
     }
 
     #[test]
-    fn tie_when_open_equals_close() {
+    fn tie_goes_up_when_open_equals_close() {
         let t = ChainlinkTracker::new();
         let coin = Coin::Btc;
         let period = Period::Five;
@@ -652,7 +651,7 @@ mod tests {
         t.on_tick(coin, dec!(50), re);
         assert_eq!(
             t.try_resolve_outcome(coin, period, rs),
-            Some(ChainlinkOutcome::Tie)
+            Some(ChainlinkOutcome::UpWon)
         );
     }
 
