@@ -528,6 +528,11 @@ fn apply_chainlink_outcome_to_open_round_history(
     condition_id: &str,
     round_start: i64,
     outcome: ChainlinkOutcome,
+    telegram: &Arc<TelegramBot>,
+    chainlink_open_f: f64,
+    chainlink_close_f: f64,
+    strategy_logger: &Option<Arc<Mutex<StrategyLogger>>>,
+    spot_feeds: &Option<Arc<HashMap<Coin, watch::Receiver<SpotState>>>>,
 ) {
     let mut g = match round_history.lock() {
         Ok(g) => g,
@@ -568,6 +573,47 @@ fn apply_chainlink_outcome_to_open_round_history(
             e.status,
             e.pnl,
         );
+        let position_outcome = if matches!(outcome, ChainlinkOutcome::Tie) {
+            "TIE"
+        } else if won {
+            "WON"
+        } else {
+            "LOST"
+        };
+        let entry_pf = e.entry_price.to_f64().unwrap_or(0.0);
+        let time_left_u = (e.round_end - e.fill_time.timestamp()).max(0) as u64;
+        let pnl_f = pnl.to_f64().unwrap_or(0.0);
+        if let (Some(sl), Some(spot_arc)) = (strategy_logger, spot_feeds) {
+            let binance_spot_close = spot_arc
+                .get(&e.coin)
+                .map(|r| r.borrow().price)
+                .and_then(|d| d.to_f64());
+            if let Ok(guard) = sl.lock() {
+                if let Err(err) = guard.log_resolution(
+                    e.coin.as_str(),
+                    &format!("{}m", e.period.as_minutes()),
+                    e.round_start,
+                    &e.side_label,
+                    chainlink_close_f,
+                    position_outcome,
+                    pnl_f,
+                    binance_spot_close,
+                ) {
+                    warn!(error = %err, "strategy_log log_resolution failed (chainlink apply)");
+                }
+            }
+        }
+        telegram.send_round_resolution(
+            e.coin.as_str(),
+            &format!("{}m", e.period.as_minutes()),
+            &e.side_label,
+            entry_pf,
+            position_outcome,
+            pnl_f,
+            chainlink_open_f,
+            chainlink_close_f,
+            time_left_u,
+        );
     }
 }
 
@@ -601,7 +647,17 @@ fn finalize_open_round_resolution(
         );
     }
 
-    apply_chainlink_outcome_to_open_round_history(round_history, condition_id, round_start, outcome);
+    apply_chainlink_outcome_to_open_round_history(
+        round_history,
+        condition_id,
+        round_start,
+        outcome,
+        telegram,
+        chainlink_open_f,
+        chainlink_close_f,
+        strategy_logger,
+        spot_feeds,
+    );
 
     if let Ok(rh) = round_history.lock() {
         for e in rh.iter() {
@@ -651,19 +707,21 @@ fn finalize_open_round_resolution(
                     }
                 }
             }
-            let entry_pf = e.entry_price.to_f64().unwrap_or(0.0);
-            let time_left_u = (e.round_end - e.fill_time.timestamp()).max(0) as u64;
-            telegram.send_round_resolution(
-                e.coin.as_str(),
-                &format!("{}m", e.period.as_minutes()),
-                &e.side_label,
-                entry_pf,
-                position_outcome,
-                pnl_f,
-                chainlink_open_f,
-                chainlink_close_f,
-                time_left_u,
-            );
+            if e.status == RoundHistoryStatus::Hedged {
+                let entry_pf = e.entry_price.to_f64().unwrap_or(0.0);
+                let time_left_u = (e.round_end - e.fill_time.timestamp()).max(0) as u64;
+                telegram.send_round_resolution(
+                    e.coin.as_str(),
+                    &format!("{}m", e.period.as_minutes()),
+                    &e.side_label,
+                    entry_pf,
+                    position_outcome,
+                    pnl_f,
+                    chainlink_open_f,
+                    chainlink_close_f,
+                    time_left_u,
+                );
+            }
         }
     }
     if let Some(t) = tracker {
@@ -684,9 +742,9 @@ fn gamma_poll_interval_secs(_round_start: i64, _period: Period) -> u64 {
     3
 }
 
-/// Settle OPEN rows from **Gamma only** (same source as the app: `outcomePrices` + `closed`).
-/// Finalizes as soon as [`infer_up_won_from_prices_and_labels`] returns `Some` — often **before** `closed=true`.
-/// [`gamma_poll_interval_secs`] polls every **3s** after `round_end` until outcome prices are decisive.
+/// Settle OPEN rows from **Gamma** (`outcomePrices` + `closed`). Winner comes only from Gamma; the
+/// Chainlink tracker (if passed) is still used for open/close **prices** in logs/Telegram after finalize.
+/// [`gamma_poll_interval_secs`] polls every **3s** until outcome prices are decisive.
 pub async fn resolve_round_history_open_entries_chainlink_or_gamma(
     tracker: Option<Arc<ChainlinkTracker>>,
     client: &reqwest::Client,

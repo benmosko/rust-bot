@@ -55,27 +55,28 @@ pub struct Config {
     pub snipe_max_replacements: u32,
     #[allow(dead_code)]
     pub snipe_no_crossover_secs: u64,
-    /// Max shares per sniper leg (cap).
-    pub sniper_max_shares: Decimal,
     /// Fraction of USDC balance to size each sniper entry (e.g. 0.01 = 1%).
     pub sniper_capital_deploy_pct: Decimal,
     /// Minimum shares per sniper order after sizing (floor then apply this floor).
     pub sniper_min_shares: Decimal,
     /// Minimum best_ask on a side before sniper may enter (event-driven threshold and entry gate).
     pub sniper_entry_min_best_ask: Decimal,
-    /// Max confirmed primary sniper GTC fills per `(Period, round_start)` across all coins; then cancel rests.
+    /// Max confirmed primary sniper GTC fills **per coin** per `(period, round_start)`; then cancel rests on that market.
     pub sniper_max_fills_per_round: u32,
-    /// Single-leg sniper hedge: GTC on the other side one tick inside best ask when `fill_price + hedge_limit` ≤ this.
-    /// Set to `1.00` to disable (default active hedge uses `0.99`).
-    pub sniper_hedge_max_pair_cost: Decimal,
     /// Seconds before round end when sniper may activate for rounds ≤ 5 minutes long (see [`Config::sniper_entry_window_secs`]).
     pub sniper_entry_window_5m: u64,
     /// Seconds before round end when sniper may activate for rounds longer than 5 minutes.
     pub sniper_entry_window_15m: u64,
+    /// If true, when Polymarket **best_ask** on a leg is ≥ [`sniper_entry_min_best_ask`] but Binance spot is still
+    /// within a small **relative** distance of the round's Binance start (`opening_price` in sniper), skip until
+    /// CEX has moved enough (avoids buying a "hot" PM leg while spot is still flat vs round open).
+    pub sniper_min_distance_from_open_filter: bool,
+    /// If true, block when Binance looks like it's mean-reverting back toward round open vs 10s ago.
+    pub sniper_momentum_reversal_filter: bool,
+    /// If true, block when Binance spot slope over ~30s trends against the entry side (YES/NO).
+    pub sniper_slope_filter: bool,
 
     // Risk
-    #[allow(dead_code)]
-    pub max_concurrent_rounds: usize,
     #[allow(dead_code)]
     pub daily_loss_limit_pct: Decimal,
     #[allow(dead_code)]
@@ -268,18 +269,13 @@ impl Config {
             .parse::<u64>()
             .context("SNIPE_NO_CROSSOVER_SECS must be a number")?;
 
-        let sniper_max_shares = env::var("SNIPER_MAX_SHARES")
-            .unwrap_or_else(|_| "10".to_string())
-            .parse::<Decimal>()
-            .context("SNIPER_MAX_SHARES must be a decimal")?;
-
         let sniper_capital_deploy_pct = env::var("SNIPER_CAPITAL_DEPLOY_PCT")
             .unwrap_or_else(|_| "0.01".to_string())
             .parse::<Decimal>()
             .context("SNIPER_CAPITAL_DEPLOY_PCT must be a decimal")?;
 
         let sniper_min_shares = env::var("SNIPER_MIN_SHARES")
-            .unwrap_or_else(|_| "3".to_string())
+            .unwrap_or_else(|_| "6".to_string())
             .parse::<Decimal>()
             .context("SNIPER_MIN_SHARES must be a decimal")?;
 
@@ -293,27 +289,30 @@ impl Config {
             .parse::<u32>()
             .context("SNIPER_MAX_FILLS_PER_ROUND must be a positive integer")?;
 
-        let sniper_hedge_max_pair_cost = env::var("SNIPER_HEDGE_MAX_PAIR_COST")
-            .unwrap_or_else(|_| "0.99".to_string())
-            .parse::<Decimal>()
-            .context("SNIPER_HEDGE_MAX_PAIR_COST must be a decimal")?;
-
         let sniper_entry_window_5m = env::var("SNIPER_ENTRY_WINDOW_5M")
-            .unwrap_or_else(|_| "60".to_string())
+            .unwrap_or_else(|_| "130".to_string())
             .parse::<u64>()
             .context("SNIPER_ENTRY_WINDOW_5M must be a positive integer (seconds)")?;
 
         let sniper_entry_window_15m = env::var("SNIPER_ENTRY_WINDOW_15M")
-            .unwrap_or_else(|_| "180".to_string())
+            .unwrap_or_else(|_| "300".to_string())
             .parse::<u64>()
             .context("SNIPER_ENTRY_WINDOW_15M must be a positive integer (seconds)")?;
 
-        // Risk
-        let max_concurrent_rounds = env::var("MAX_CONCURRENT_ROUNDS")
-            .unwrap_or_else(|_| "4".to_string())
-            .parse::<usize>()
-            .context("MAX_CONCURRENT_ROUNDS must be a number")?;
+        let sniper_min_distance_from_open_filter = env::var("SNIPER_MIN_DISTANCE_FROM_OPEN_FILTER")
+            .unwrap_or_else(|_| "false".to_string())
+            .parse::<bool>()
+            .unwrap_or(false);
+        let sniper_momentum_reversal_filter = env::var("SNIPER_MOMENTUM_REVERSAL_FILTER")
+            .unwrap_or_else(|_| "false".to_string())
+            .parse::<bool>()
+            .unwrap_or(false);
+        let sniper_slope_filter = env::var("SNIPER_SLOPE_FILTER")
+            .unwrap_or_else(|_| "true".to_string())
+            .parse::<bool>()
+            .unwrap_or(true);
 
+        // Risk
         let daily_loss_limit_pct = env::var("DAILY_LOSS_LIMIT_PCT")
             .unwrap_or_else(|_| "0.20".to_string())
             .parse::<Decimal>()
@@ -421,15 +420,15 @@ impl Config {
             snipe_position_size_pct,
             snipe_max_replacements,
             snipe_no_crossover_secs,
-            sniper_max_shares,
             sniper_capital_deploy_pct,
             sniper_min_shares,
             sniper_entry_min_best_ask,
             sniper_max_fills_per_round,
-            sniper_hedge_max_pair_cost,
             sniper_entry_window_5m,
             sniper_entry_window_15m,
-            max_concurrent_rounds,
+            sniper_min_distance_from_open_filter,
+            sniper_momentum_reversal_filter,
+            sniper_slope_filter,
             daily_loss_limit_pct,
             circuit_breaker_consecutive_losses,
             circuit_breaker_pause_secs,

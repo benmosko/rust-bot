@@ -507,7 +507,6 @@ impl MarketMaker {
                         balance,
                         yes_buy_price,
                         no_buy_price,
-                        self.config.sniper_max_shares,
                         self.config.sniper_capital_deploy_pct,
                         self.config.sniper_min_shares,
                     ) {
@@ -528,7 +527,6 @@ impl MarketMaker {
                     match strategy_sizing::compute_single_leg_sizing(
                         balance,
                         yes_buy_price,
-                        self.config.sniper_max_shares,
                         self.config.sniper_capital_deploy_pct,
                         self.config.sniper_min_shares,
                     ) {
@@ -549,7 +547,6 @@ impl MarketMaker {
                     match strategy_sizing::compute_single_leg_sizing(
                         balance,
                         no_buy_price,
-                        self.config.sniper_max_shares,
                         self.config.sniper_capital_deploy_pct,
                         self.config.sniper_min_shares,
                     ) {

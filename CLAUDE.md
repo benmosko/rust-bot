@@ -40,7 +40,7 @@ Rust Polymarket sniper bot with hedge. Runs on AWS EC2 24/7. Trades crypto up/do
 | `SNIPER_MAX_SHARES` | `10` |
 | `SNIPER_CAPITAL_DEPLOY_PCT` | `0.01` |
 | `SNIPER_MIN_SHARES` | `3` |
-| `SNIPER_MAX_FILLS_PER_ROUND` | `2` |
+| `SNIPER_MAX_FILLS_PER_ROUND` | `2` (per coin per round window; not shared across coins) |
 | `SNIPER_ENTRY_MIN_BEST_ASK` | `0.96` |
 | `SNIPER_HEDGE_MAX_PAIR_COST` | `0.99` |
 | `SNIPER_ENTRY_WINDOW_5M` | `60` |
@@ -123,7 +123,7 @@ $env:RUST_LOG="info"; $env:STRATEGY_MODE="sniper_only"; cargo run --profile rele
 
 ## Current Strategy
 - **sniper_only** with hedge
-- Shotgun: GTC on all qualifying markets, cap at `SNIPER_MAX_FILLS_PER_ROUND=2` per (Period, round_start)
+- Shotgun: GTC on all qualifying markets; cap `SNIPER_MAX_FILLS_PER_ROUND` **per coin** per (Period, round_start) — all four coins can each fill up to that cap in the same 5m/15m slot
 - Hedge: GTC buy at $0.01 (min price) on other side immediately after primary fill. Skip if `entry_price >= 0.99` or `entry_price + 0.01 > SNIPER_HEDGE_MAX_PAIR_COST`. No orderbook watching.
 - Entry: only when `best_ask >= SNIPER_ENTRY_MIN_BEST_ASK` and within entry window (5m vs 15m rounds)
 

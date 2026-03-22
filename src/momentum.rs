@@ -420,7 +420,6 @@ impl Momentum {
             let sized = match strategy_sizing::compute_single_leg_sizing(
                 balance,
                 order_price,
-                self.config.sniper_max_shares,
                 self.config.sniper_capital_deploy_pct,
                 self.config.sniper_min_shares,
             ) {

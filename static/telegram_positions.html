@@ -126,6 +126,13 @@
           var m = Math.floor(rem / 60);
           var s = rem % 60;
           var timeStr = m > 0 ? m + "m " + s + "s" : rem + "s";
+          var sh = (p.shares != null && !isNaN(p.shares))
+            ? (Number(p.shares).toFixed(4).replace(/\.?0+$/, "") + " sh @ ")
+            : "";
+          var priceCell = (sh || "@ ") + p.entry_price.toFixed(4);
+          var rng = p.round_time_range_utc
+            ? '<div style="font-size:0.8rem;color:#8b949e;margin-top:6px">' + escapeHtml(p.round_time_range_utc) + "</div>"
+            : "";
           html +=
             "<li><div class=\"row\"><span class=\"sym\">" +
             escapeHtml(p.coin) +
@@ -133,9 +140,9 @@
             escapeHtml(p.period) +
             " " +
             escapeHtml(p.side) +
-            '</span><span class="price">@ ' +
-            p.entry_price.toFixed(4) +
+            '</span><span class="price">' + priceCell +
             "</span></div>" +
+            rng +
             '<div class="' +
             cls +
             '">' +

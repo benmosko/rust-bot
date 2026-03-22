@@ -8,7 +8,7 @@
 - **When**: Within `SNIPER_ENTRY_WINDOW_5M` or `SNIPER_ENTRY_WINDOW_15M` sec before round end (period-dependent)
 - **Gate**: `best_ask >= SNIPER_ENTRY_MIN_BEST_ASK` (0.96) on YES or NO
 - **Trigger**: Price threshold events from OrderbookManager (sub-2ms latency) or 100ms fallback
-- **Cap**: `SNIPER_MAX_FILLS_PER_ROUND` primary fills per (Period, round_start) across all coins
+- **Cap**: `SNIPER_MAX_FILLS_PER_ROUND` primary fills per **coin** per (Period, round_start) (each market independent)
 - **Sizing**: `strategy_sizing::compute_single_leg_sizing(balance, price, max_shares, deploy_pct, min_shares)`
 - **Order**: GTC limit at best_ask (or one tick inside); min 5 shares
 
@@ -21,7 +21,7 @@
 | Var | Purpose |
 |-----|---------|
 | `SNIPER_ENTRY_MIN_BEST_ASK` | Min best_ask to consider entry |
-| `SNIPER_MAX_FILLS_PER_ROUND` | Cap primary fills per slot |
+| `SNIPER_MAX_FILLS_PER_ROUND` | Cap primary fills per coin per round window |
 | `SNIPER_HEDGE_MAX_PAIR_COST` | Pair cost threshold for hedge; 1.00 = disable |
 | `SNIPER_ENTRY_WINDOW_5M` | Sec before end for ≤5m rounds |
 | `SNIPER_ENTRY_WINDOW_15M` | Sec before end for >5m rounds |

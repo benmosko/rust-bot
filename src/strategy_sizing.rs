@@ -2,7 +2,6 @@
 
 use anyhow::{bail, Result};
 use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
 use std::str::FromStr;
 
 #[derive(Debug, Clone)]
@@ -12,7 +11,6 @@ pub struct SingleLegSizing {
     pub price: Decimal,
     pub calc_shares: Decimal,
     pub min_shares: Decimal,
-    pub max_shares: Decimal,
     pub final_shares: Decimal,
 }
 
@@ -23,15 +21,14 @@ pub struct DualLegSizing {
     pub sum_px: Decimal,
     pub calc_per_leg: Decimal,
     pub min_shares: Decimal,
-    pub max_per_leg: Decimal,
     pub final_per_leg: Decimal,
 }
 
-/// `max(floor(balance * capital_deploy_pct / price), min_shares)`, capped at `max_shares`.
+/// `max(floor(balance * capital_deploy_pct / price), min_shares)`. Notional is at most `deploy_pct`
+/// of balance when `calc_shares >= min_shares`; otherwise the `min_shares` floor may exceed that budget.
 pub fn compute_single_leg_sizing(
     balance: Decimal,
     price: Decimal,
-    max_shares: Decimal,
     deploy_pct: Decimal,
     min_shares: Decimal,
 ) -> Result<SingleLegSizing> {
@@ -41,7 +38,7 @@ pub fn compute_single_leg_sizing(
 
     let budget = balance * deploy_pct;
     let calc_shares = (budget / price).floor().round_dp(0);
-    let final_shares = calc_shares.max(min_shares).min(max_shares);
+    let final_shares = calc_shares.max(min_shares);
 
     let cost = final_shares * price;
     if cost > balance {
@@ -60,7 +57,6 @@ pub fn compute_single_leg_sizing(
         price,
         calc_shares,
         min_shares,
-        max_shares,
         final_shares,
     })
 }
@@ -70,7 +66,6 @@ pub fn compute_per_leg_dual(
     balance: Decimal,
     maker_yes: Decimal,
     maker_no: Decimal,
-    max_shares: Decimal,
     deploy_pct: Decimal,
     min_shares: Decimal,
 ) -> Result<DualLegSizing> {
@@ -79,25 +74,9 @@ pub fn compute_per_leg_dual(
         bail!("dual sizing: zero combined maker price");
     }
 
-    let max_per_leg = (max_shares / dec!(2)).round_dp(2);
-    if max_per_leg < min_shares {
-        bail!(
-            "dual sizing: max_shares/2 ({}) < min_shares ({})",
-            max_per_leg,
-            min_shares
-        );
-    }
-
     let budget = balance * deploy_pct;
     let calc_per_leg = (budget / sum_px).floor().round_dp(0);
     let mut per_leg = calc_per_leg.max(min_shares);
-    if per_leg > max_per_leg {
-        bail!(
-            "dual sizing: per-leg {} exceeds half of max_shares ({})",
-            per_leg,
-            max_per_leg
-        );
-    }
 
     let cost = per_leg * sum_px;
     if cost > balance {
@@ -118,7 +97,6 @@ pub fn compute_per_leg_dual(
         sum_px,
         calc_per_leg,
         min_shares,
-        max_per_leg,
         final_per_leg: per_leg,
     })
 }

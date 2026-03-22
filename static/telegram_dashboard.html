@@ -25,6 +25,11 @@
       color: var(--fg);
       min-height: 100vh;
       padding: 12px 14px 24px;
+      max-width: 1000px;
+      margin-left: auto;
+      margin-right: auto;
+      width: 100%;
+      box-sizing: border-box;
     }
     h1 { font-size: 1.05rem; font-weight: 600; margin: 0 0 4px; color: var(--muted); }
     .sub { font-size: 0.75rem; color: var(--muted); margin-bottom: 14px; }
@@ -65,6 +70,53 @@
     .k { color: var(--muted); font-size: 0.78rem; }
     .v { font-variant-numeric: tabular-nums; text-align: right; max-width: 65%; word-break: break-word; }
     footer { margin-top: 14px; font-size: 0.7rem; color: var(--muted); }
+    .live-wrap {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      margin: 0 -4px;
+      padding: 0 4px;
+    }
+    table.live {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.8rem;
+    }
+    table.live th {
+      text-align: left;
+      font-size: 0.68rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+      padding: 8px 6px;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+      position: sticky;
+      top: 0;
+      background: var(--card);
+    }
+    table.live td {
+      padding: 8px 6px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+    table.live td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    table.live tr:last-child td { border-bottom: none; }
+    .elapsed-bar {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      white-space: nowrap;
+    }
+    .bar {
+      font-family: ui-monospace, monospace;
+      font-size: 0.72rem;
+      letter-spacing: -0.05em;
+      color: var(--muted);
+    }
+    .st-wait { color: var(--muted); }
+    .st-act { color: var(--good); }
+    .st-end { color: var(--warn); }
+    .sub-hint { font-size: 0.72rem; color: var(--muted); margin-top: 2px; }
   </style>
 </head>
 <body>
@@ -99,11 +151,31 @@
       <div class="val" id="posCount">—</div>
     </div>
     <div class="card wide">
+      <div class="label">Live markets (CLOB best ask · same as TUI)</div>
+      <div class="sub-hint" style="margin-bottom:8px">All configured coin × period rounds — YES / NO are prices to buy each outcome.</div>
+      <div class="live-wrap">
+        <table class="live" id="liveTable" aria-label="Live round prices">
+          <thead>
+            <tr>
+              <th>Market</th>
+              <th>Round (UTC)</th>
+              <th>Elapsed</th>
+              <th class="num">YES</th>
+              <th class="num">NO</th>
+              <th>Strategy</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody id="liveBody"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="card wide">
       <div class="label">Positions</div>
       <ul id="posList"></ul>
     </div>
     <div class="card wide">
-      <div class="label">Strategy status</div>
+      <div class="label">Strategy status (per round)</div>
       <ul id="stList"></ul>
     </div>
   </div>
@@ -126,6 +198,26 @@
       if (h > 0) return h + 'h ' + m + 'm';
       if (m > 0) return m + 'm ' + s + 's';
       return s + 's';
+    }
+
+    function fmtYesNo(p, status) {
+      if (p == null || isNaN(p)) return '—';
+      if (p === 0) return status === 'Waiting' ? '$0.00' : 'N/A';
+      return '$' + p.toFixed(2);
+    }
+
+    function elapsedBar(pct) {
+      const p = Math.max(0, Math.min(1, pct));
+      const n = Math.round(p * 10);
+      let s = '';
+      for (let i = 0; i < 10; i++) s += (i < n ? '█' : '░');
+      return s;
+    }
+
+    function statusClass(st) {
+      if (st === 'Active') return 'st-act';
+      if (st === 'Ended') return 'st-end';
+      return 'st-wait';
     }
 
     async function poll() {
@@ -198,9 +290,43 @@
             const sub = rem > 0
               ? rem + 's to round end'
               : 'Round ended · position open until resolved';
+            const range = p.round_time_range_utc ? (' · ' + p.round_time_range_utc) : '';
+            const sh = (p.shares != null && !isNaN(p.shares))
+              ? (Number(p.shares).toFixed(4).replace(/\.?0+$/, '') + ' sh @ ')
+              : '';
+            const priceCell = (sh || '@ ') + p.entry_price.toFixed(4);
             const li = document.createElement('li');
-            li.innerHTML = '<div class="row"><span><b>' + p.coin + '</b> ' + p.period + ' ' + p.side + '</span><span class="v">@ ' + p.entry_price.toFixed(4) + '</span></div><div style="margin-top:6px;font-size:0.85rem;color:var(--muted)">' + sub + '</div>';
+            li.innerHTML = '<div class="row"><span><b>' + p.coin + '</b> ' + p.period + ' ' + p.side + '</span><span class="v">' + priceCell + '</span></div><div style="margin-top:6px;font-size:0.85rem;color:var(--muted)">' + sub + range + '</div>';
             posList.appendChild(li);
+          }
+        }
+
+        const liveBody = document.getElementById('liveBody');
+        liveBody.innerHTML = '';
+        const lr = d.live_rounds || [];
+        if (lr.length === 0) {
+          const tr = document.createElement('tr');
+          const td = document.createElement('td');
+          td.colSpan = 7;
+          td.style.color = 'var(--muted)';
+          td.style.padding = '12px 6px';
+          td.textContent = 'No live rows yet (waiting for main loop).';
+          tr.appendChild(td);
+          liveBody.appendChild(tr);
+        } else {
+          for (const r of lr) {
+            const tr = document.createElement('tr');
+            const pct = typeof r.elapsed_pct === 'number' ? r.elapsed_pct : 0;
+            const pctLabel = Math.round(pct * 100) + '%';
+            tr.innerHTML =
+              '<td><b>' + escapeHtml(r.market_label || (r.coin + ' ' + r.period)) + '</b></td>' +
+              '<td class="k">' + escapeHtml(r.round_time_range_utc || '') + '</td>' +
+              '<td><span class="elapsed-bar"><span class="bar">' + elapsedBar(pct) + '</span><span class="k">' + pctLabel + '</span></span></td>' +
+              '<td class="num">' + fmtYesNo(r.yes_ask, r.status) + '</td>' +
+              '<td class="num">' + fmtYesNo(r.no_ask, r.status) + '</td>' +
+              '<td>' + escapeHtml(r.strategy || '—') + '</td>' +
+              '<td class="' + statusClass(r.status) + '">' + escapeHtml(r.status || '') + '</td>';
+            liveBody.appendChild(tr);
           }
         }
 

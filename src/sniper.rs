@@ -14,10 +14,10 @@ use crate::types::{
 use anyhow::{anyhow, Context, Result};
 use chrono::{Local, Utc};
 use dashmap::{DashMap, DashSet};
-use polymarket_client_sdk::clob::types::{OrderType, Side};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal_macros::dec;
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -33,22 +33,56 @@ const MOMENTUM_REVERSAL_THRESHOLD: f64 = 0.4;
 const MOMENTUM_DIRECTIONAL_THRESHOLD: f64 = 0.3;
 /// Floor for distance-from-open in `recovery_ratio` to avoid division blow-ups near zero.
 const MOMENTUM_DISTANCE_FLOOR: f64 = 0.0001;
+/// Block when normalized spot slope (bps/sec scaled) trends against the entry side by more than this.
+const SLOPE_AGAINST_THRESHOLD: f64 = 0.02;
+
+/// Minimum |Binance spot − round open| / open required for sniper entry, from PM conviction, time left, period, and spread.
+fn min_distance_required(pm_ask: f64, pm_bid: f64, time_remaining: i64, period: Period) -> f64 {
+    // Base distance depends on Polymarket's conviction level
+    let base = if pm_ask >= 0.98 {
+        0.0001 // 0.01% — PM very confident
+    } else if pm_ask >= 0.97 {
+        0.0002 // 0.02%
+    } else if pm_ask >= 0.96 {
+        0.0003 // 0.03%
+    } else if pm_ask >= 0.95 {
+        0.0005 // 0.05%
+    } else {
+        0.0015 // 0.15% — PM unsure, need strong CEX move
+    };
+
+    // Time scaling: more time left = need more distance (more room for reversal)
+    let (window, time_mult) = match period {
+        Period::Five => (130.0, 1.5),
+        Period::Fifteen | Period::Sixty => (180.0, 3.0),  // was 300.0
+    };
+    let frac = (time_remaining as f64 / window).clamp(0.0, 1.0);
+    let multiplier = 1.0 + time_mult * frac;
+
+    let mut req = base * multiplier;
+
+    let spread = pm_ask - pm_bid;
+    if spread > 0.10 {
+        // Wide spread: market uncertain. Add extra distance requirement.
+        let extra = (spread - 0.10) * 0.005; // 0.5% per 1.0 of spread above 0.10
+        req += extra;
+    }
+
+    req
+}
+
+struct EntryQualityBlocked {
+    detail: String,
+    side: String,
+    pm_ask: f64,
+    distance_pct: f64,
+    required: f64,
+    time_remaining: i64,
+}
 
 enum SniperSizingPlan {
     Single(SingleLegSizing),
     Dual(DualLegSizing),
-}
-
-/// After a single-leg GTC fill, optional GTC hedge on the other side at $0.01 (minimum price).
-/// Placed immediately after primary fill; no orderbook watching. Size matches the sniper fill exactly.
-struct ActiveHedgeOrder {
-    order_id: String,
-    round_history_id: String,
-    sniper_fill_price: Decimal,
-    hedge_side: String,
-    order_size: Decimal,
-    limit_price: Decimal,
-    next_poll_at: Instant,
 }
 
 /// One resting GTC sniper leg (YES and/or NO in dual mode).
@@ -89,6 +123,8 @@ pub struct Sniper {
     binance_spot_history: SharedBinanceSpotHistory,
     momentum_blocks: Arc<AtomicU64>,
     last_momentum_block: Arc<Mutex<Option<String>>>,
+    /// Dedupe high-frequency `log_sniper_decision` rows (key → last log time).
+    decision_log_throttle: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 impl Sniper {
@@ -142,12 +178,85 @@ impl Sniper {
             binance_spot_history,
             momentum_blocks,
             last_momentum_block,
+            decision_log_throttle: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Returns false if `reason_code` was logged within the last `secs` for this market round (caller should skip).
+    fn decision_throttle_try_acquire(&self, reason_code: &str, secs: u64) -> bool {
+        let key = format!("{}|{}|{}", self.market.slug, self.market.round_start, reason_code);
+        if let Ok(mut guard) = self.decision_log_throttle.lock() {
+            let now = Instant::now();
+            if let Some(prev) = guard.get(&key) {
+                if prev.elapsed() < Duration::from_secs(secs) {
+                    return false;
+                }
+            }
+            guard.insert(key, now);
+            true
+        } else {
+            true
+        }
+    }
+
+    /// Persist a skip/block reason to `sniper_decision_events` (optional throttle per slug+round+code).
+    fn log_sniper_decision(
+        &self,
+        reason_code: &str,
+        detail: Option<String>,
+        throttle_secs: Option<u64>,
+    ) {
+        if let Some(secs) = throttle_secs {
+            if !self.decision_throttle_try_acquire(reason_code, secs) {
+                return;
+            }
+        }
+
+        let now_dt = Utc::now();
+        let ts = now_dt.timestamp();
+        let ts_ms = now_dt.timestamp_subsec_millis() as i32;
+        let yes = self
+            .orderbook
+            .get_orderbook(&self.market.up_token_id)
+            .and_then(|o| o.best_ask().and_then(|d| d.to_f64()));
+        let no = self
+            .orderbook
+            .get_orderbook(&self.market.down_token_id)
+            .and_then(|o| o.best_ask().and_then(|d| d.to_f64()));
+        let tr = (self.market.round_end - ts).max(0);
+        let filled = self.gtc_filled_count.load(Ordering::Relaxed);
+        let rd = (self.market.round_end - self.market.round_start).max(0);
+        let entry_window_secs = self.config.sniper_entry_window_secs(rd) as i32;
+        let coin = self.market.coin.as_str();
+        let period = format!("{}m", self.market.period.as_minutes());
+
+        if let Ok(g) = self.strategy_logger.lock() {
+            if let Err(e) = g.log_sniper_decision(
+                ts,
+                ts_ms,
+                coin,
+                &period,
+                self.market.round_start,
+                self.market.round_end,
+                reason_code,
+                detail.as_deref(),
+                yes,
+                no,
+                tr,
+                Some(filled),
+                Some(entry_window_secs),
+            ) {
+                warn!(market = %self.market.slug, error = %e, "log_sniper_decision failed");
+            }
         }
     }
 
     /// Last gate before placing GTC: block fast mean reversion toward round open (Binance vs `opening_price`).
     /// Returns a short description when this leg should **not** be entered. Fails open when history is missing or ambiguous.
     fn momentum_reversal_block_detail(&self, side_name: &str) -> Option<String> {
+        if !self.config.sniper_momentum_reversal_filter {
+            return None;
+        }
         let side_label = if side_name == "YES" { "UP" } else { "DOWN" };
         let opening_price = match self.opening_price.to_f64() {
             Some(p) if p > 0.0 => p,
@@ -203,6 +312,131 @@ impl Sniper {
             coin = ?self.market.coin,
             recovery_ratio = %recovery_ratio,
             "Momentum filter: OK"
+        );
+        None
+    }
+
+    /// |Binance spot − Binance round ref| / ref — `opening_price` is the Binance snapshot passed at sniper start (main).
+    fn distance_from_open_pct(&self) -> Option<f64> {
+        let binance_ref = self.opening_price.to_f64()?;
+        let binance_spot = self.spot_receiver.borrow().price.to_f64()?;
+        if binance_ref <= 0.0 || binance_spot <= 0.0 {
+            return None;
+        }
+        Some((binance_spot - binance_ref).abs() / binance_ref)
+    }
+
+    /// Unified entry quality gate: PM ask, Binance distance from round open, and time remaining.
+    /// Returns `Some` when this leg should not be entered. When the filter is off or distance is unavailable, returns `None` (fail open).
+    fn entry_quality_eval(
+        &self,
+        side_name: &str,
+        best_ask: Decimal,
+        pm_bid: f64,
+    ) -> Option<EntryQualityBlocked> {
+        if !self.config.sniper_min_distance_from_open_filter {
+            return None;
+        }
+        let distance_pct = self.distance_from_open_pct()?;
+        let pm_ask = best_ask.to_f64().unwrap_or(0.0);
+        let time_remaining = (self.market.round_end - Utc::now().timestamp()).max(0);
+        let required = min_distance_required(pm_ask, pm_bid, time_remaining, self.market.period);
+        let side_label = if side_name == "YES" {
+            "UP".to_string()
+        } else {
+            "DOWN".to_string()
+        };
+        if distance_pct < required {
+            let coin_u = self.market.coin.as_str().to_uppercase();
+            let period_m = format!("{}m", self.market.period.as_minutes());
+            let detail = format!(
+                "{} {} {} pm_ask={} dist_pct={:.6} < required={:.6} tr={}s",
+                coin_u, period_m, side_label, best_ask, distance_pct, required, time_remaining
+            );
+            return Some(EntryQualityBlocked {
+                detail,
+                side: side_label,
+                pm_ask,
+                distance_pct,
+                required,
+                time_remaining,
+            });
+        }
+        debug!(
+            coin = ?self.market.coin,
+            side = %side_label,
+            pm_ask,
+            distance_pct = %distance_pct,
+            required = %required,
+            time_remaining,
+            "Entry quality: OK"
+        );
+        None
+    }
+
+    /// Binance spot linear slope over the last ~30s; block if price trends against the entry side. Fail open if data is thin.
+    fn spot_slope_blocks_entry(&self, side_name: &str) -> Option<String> {
+        if !self.config.sniper_slope_filter {
+            return None;
+        }
+        let chainlink_open = match self.opening_price.to_f64() {
+            Some(p) if p > 0.0 => p,
+            _ => return None,
+        };
+        let now = Utc::now().timestamp();
+        let map_ref = self.binance_spot_history.get(&self.market.coin)?;
+        let guard = map_ref.value().lock().ok()?;
+        let q = &*guard;
+        let mut xs: Vec<f64> = Vec::new();
+        let mut ys: Vec<f64> = Vec::new();
+        let t0 = (now - 30) as f64;
+        for (ts, price) in q.iter() {
+            if *ts >= now - 30 && *ts <= now && *price > 0.0 {
+                xs.push(*ts as f64 - t0);
+                ys.push(*price);
+            }
+        }
+        if xs.len() < 5 {
+            return None;
+        }
+        let n = xs.len() as f64;
+        let mean_x: f64 = xs.iter().sum::<f64>() / n;
+        let mean_y: f64 = ys.iter().sum::<f64>() / n;
+        let mut cov = 0.0;
+        let mut var_x = 0.0;
+        for i in 0..xs.len() {
+            let dx = xs[i] - mean_x;
+            let dy = ys[i] - mean_y;
+            cov += dx * dy;
+            var_x += dx * dx;
+        }
+        if var_x <= 1e-18 {
+            return None;
+        }
+        let slope = cov / var_x;
+        let normalized_slope = slope / chainlink_open * 10000.0;
+
+        let side_label = if side_name == "YES" {
+            "UP"
+        } else {
+            "DOWN"
+        };
+        let against = match side_name {
+            "YES" => normalized_slope < -SLOPE_AGAINST_THRESHOLD,
+            "NO" => normalized_slope > SLOPE_AGAINST_THRESHOLD,
+            _ => return None,
+        };
+        if against {
+            return Some(format!(
+                "slope {:.3} against {}",
+                normalized_slope, side_label
+            ));
+        }
+        debug!(
+            coin = ?self.market.coin,
+            side = %side_label,
+            normalized_slope,
+            "Spot slope filter: OK"
         );
         None
     }
@@ -289,6 +523,68 @@ impl Sniper {
         }
     }
 
+    /// Per-second Polymarket + spot snapshots into `logs/strategy.db` (`round_price_ticks` table).
+    async fn round_price_tick_loop(
+        shutdown: tokio_util::sync::CancellationToken,
+        strategy_logger: Arc<Mutex<StrategyLogger>>,
+        market: Market,
+        orderbook: Arc<OrderbookManager>,
+        spot_receiver: watch::Receiver<SpotState>,
+    ) {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let coin = market.coin.as_str().to_string();
+        let period = format!("{}m", market.period.as_minutes());
+
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    break;
+                }
+                _ = interval.tick() => {
+                    let now_ts = Utc::now().timestamp();
+                    if now_ts < market.round_start {
+                        continue;
+                    }
+                    if now_ts > market.round_end {
+                        break;
+                    }
+
+                    let yes_ob = orderbook.get_orderbook(&market.up_token_id);
+                    let no_ob = orderbook.get_orderbook(&market.down_token_id);
+                    let best_ask_yes = yes_ob.as_ref().and_then(|o| o.best_ask()).and_then(|d| d.to_f64());
+                    let best_bid_yes = yes_ob.as_ref().and_then(|o| o.best_bid()).and_then(|d| d.to_f64());
+                    let best_ask_no = no_ob.as_ref().and_then(|o| o.best_ask()).and_then(|d| d.to_f64());
+                    let best_bid_no = no_ob.as_ref().and_then(|o| o.best_bid()).and_then(|d| d.to_f64());
+                    let binance_spot = spot_receiver.borrow().price.to_f64();
+                    let time_remaining_secs = (market.round_end - now_ts).max(0);
+
+                    if let Ok(g) = strategy_logger.lock() {
+                        if let Err(e) = g.log_round_price_tick(
+                            now_ts,
+                            &coin,
+                            &period,
+                            market.round_start,
+                            market.round_end,
+                            best_ask_yes,
+                            best_ask_no,
+                            best_bid_yes,
+                            best_bid_no,
+                            binance_spot,
+                            time_remaining_secs,
+                        ) {
+                            warn!(
+                                market = %market.slug,
+                                error = %e,
+                                "strategy_log log_round_price_tick failed"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub async fn run(
         &mut self,
         shutdown: tokio_util::sync::CancellationToken,
@@ -306,7 +602,6 @@ impl Sniper {
 
         let status_key = strategy_status_key(self.market.coin, self.market.period, self.market.round_start, "sniper");
         let mut active_legs: Vec<ActiveSniperLeg> = Vec::new();
-        let mut pending_hedge: Option<ActiveHedgeOrder> = None;
 
         // EVENT-DRIVEN SNIPER: Sub-2ms detection latency
         // The sniper now uses event-driven triggers instead of polling:
@@ -327,6 +622,19 @@ impl Sniper {
         // Subscribe to price threshold events (best_ask >= sniper entry minimum)
         let mut price_event_rx = self.orderbook.subscribe_price_events();
 
+        let tick_shutdown = shutdown.clone();
+        let tick_logger = self.strategy_logger.clone();
+        let tick_market = self.market.clone();
+        let tick_orderbook = self.orderbook.clone();
+        let tick_spot = self.spot_receiver.clone();
+        let _price_tick_task = tokio::spawn(Self::round_price_tick_loop(
+            tick_shutdown,
+            tick_logger,
+            tick_market,
+            tick_orderbook,
+            tick_spot,
+        ));
+
         // Fallback polling interval (safety net in case events are missed)
         let mut fallback_interval = tokio::time::interval(Duration::from_millis(100));
         fallback_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -338,15 +646,15 @@ impl Sniper {
         );
         heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // Last time we started `evaluate_entry_gates_with_orderbooks` (detect long gaps when stuck in poll / HTTP).
+        let mut last_gate_eval_at: Option<Instant> = None;
+
         loop {
             if shutdown.is_cancelled() {
                 info!(market = %self.market.slug, "Sniper shutting down");
                 for leg in &active_legs {
                     let _ = self.execution.cancel_order(&leg.order_id).await;
                     self.active_gtc_orders.remove(&leg.order_id);
-                }
-                if let Some(h) = pending_hedge.take() {
-                    self.cancel_resting_hedge_order(h, &status_key, "shutdown").await;
                 }
                 break;
             }
@@ -355,8 +663,23 @@ impl Sniper {
             let time_remaining = self.market.round_end - now;
 
             // Only activate in the configured tail of the round (period-aware via Config).
+            // Live YES/NO on the TUI can look "ready" for minutes — we do not run entry gates until
+            // `time_remaining <= entry_window_secs` (e.g. last 180s on 15m). Show time left until then.
+            // Do not log SQLite skip reasons here.
             if time_remaining > entry_window_secs as i64 {
-                self.strategy_status.insert(status_key.clone(), "Snp: Too early".to_string());
+                let ew = entry_window_secs as i64;
+                let secs_until = time_remaining - ew;
+                let tail = if secs_until >= 3600 {
+                    format!("{}h{}m", secs_until / 3600, (secs_until % 3600) / 60)
+                } else if secs_until >= 60 {
+                    format!("{}m{:02}s", secs_until / 60, secs_until % 60)
+                } else {
+                    format!("{secs_until}s")
+                };
+                self.strategy_status.insert(
+                    status_key.clone(),
+                    format!("Snp: Too early (sniper in {tail})"),
+                );
                 sleep(Duration::from_millis(500)).await;
                 continue;
             }
@@ -364,6 +687,7 @@ impl Sniper {
             // Check if sniper is paused
             if self.risk.is_sniper_paused().await {
                 self.strategy_status.insert(status_key.clone(), "Snp: Paused".to_string());
+                self.log_sniper_decision("paused", None, Some(10));
                 warn!(market = %self.market.slug, "Sniper is paused");
                 sleep(Duration::from_secs(10)).await;
                 continue;
@@ -373,6 +697,11 @@ impl Sniper {
             let balance = *self.balance_receiver.borrow();
             if balance < dec!(5) {
                 self.strategy_status.insert(status_key.clone(), "Snp: Low balance".to_string());
+                self.log_sniper_decision(
+                    "low_balance",
+                    Some(format!("balance_usdc={}", balance)),
+                    Some(5),
+                );
                 sleep(Duration::from_millis(500)).await;
                 continue;
             }
@@ -435,6 +764,7 @@ impl Sniper {
                             // Dropped messages; orderbook state is still updated on WS path — evaluate gates.
                         }
                         Err(RecvError::Closed) => {
+                            self.log_sniper_decision("price_events_channel_closed", None, None);
                             skip_entry_gates_this_iteration = true;
                         }
                     }
@@ -445,25 +775,23 @@ impl Sniper {
                 }
             };
 
-            let hedge_done = if let Some(ref mut h) = pending_hedge {
-                self.poll_sniper_hedge(h, &status_key, time_remaining).await
-            } else {
-                false
-            };
-            if hedge_done {
-                pending_hedge = None;
-            }
-
-            // Shared primary fill cap for this (Period, round_start): stop new sniper GTCs; hedge may still run.
+            // Primary fill cap for this market (coin, period, round_start): stop new sniper GTCs.
             let filled_count_outer = self.gtc_filled_count.load(Ordering::Relaxed);
-            let hedge_waiting = pending_hedge.is_some();
             let max_fills = self.max_primary_fills_per_round();
             let cap_reached = filled_count_outer >= max_fills;
             if cap_reached {
                 self.strategy_status
                     .insert(status_key.clone(), "Snp: Capped".to_string());
             }
-            if cap_reached && !hedge_waiting {
+            if cap_reached {
+                self.log_sniper_decision(
+                    "fill_cap",
+                    Some(format!(
+                        "filled={} max={}",
+                        filled_count_outer, max_fills
+                    )),
+                    Some(2),
+                );
                 sleep(Duration::from_millis(500)).await;
                 continue;
             }
@@ -472,9 +800,18 @@ impl Sniper {
                 continue;
             }
 
-            if cap_reached {
-                continue;
+            let now_eval = Instant::now();
+            if let Some(prev) = last_gate_eval_at {
+                let gap = now_eval.saturating_duration_since(prev);
+                if gap > Duration::from_secs(1) {
+                    warn!(
+                        market = %self.market.slug,
+                        gap_ms = gap.as_millis(),
+                        "sniper evaluation cycle gap > 1s since last gate eval (common: inner poll loop after GTC place — fallback_interval/select! not running; or slow CLOB/reconcile)"
+                    );
+                }
             }
+            last_gate_eval_at = Some(now_eval);
 
             // Run entry gates (triggered by event or fallback timer)
             let t0 = Instant::now(); // Start: entry conditions detected
@@ -484,12 +821,19 @@ impl Sniper {
             let yes_orderbook_opt = self.orderbook.get_orderbook(&self.market.up_token_id);
             let no_orderbook_opt = self.orderbook.get_orderbook(&self.market.down_token_id);
             let t1 = Instant::now(); // After orderbook read
-            match self.evaluate_entry_gates_with_orderbooks(yes_orderbook_opt, no_orderbook_opt).await {
+            match self
+                .evaluate_entry_gates_with_orderbooks(yes_orderbook_opt, no_orderbook_opt, Some(&status_key))
+                .await
+            {
                 Ok(Some(sides)) => {
                     let t2 = Instant::now(); // After entry gate evaluation
                     if sides.is_empty() {
                         self.strategy_status.insert(status_key.clone(), "Snp: Waiting".to_string());
-                        // Wait for next price event (event-driven, no polling delay)
+                        self.log_sniper_decision(
+                            "gate_empty_sides",
+                            None,
+                            Some(5),
+                        );
                         continue;
                     }
 
@@ -512,7 +856,14 @@ impl Sniper {
                     });
 
                     if plans.is_empty() {
-                        // Wait for next price event (event-driven, no polling delay)
+                        self.log_sniper_decision(
+                            "maker_price_unavailable",
+                            Some(format!(
+                                "tick_size={} entry_min_best_ask={}",
+                                tick_size, self.config.sniper_entry_min_best_ask
+                            )),
+                            Some(3),
+                        );
                         continue;
                     }
 
@@ -527,6 +878,11 @@ impl Sniper {
                                 side = %side_name,
                                 "Sniper: side in-flight on this market; skipping this leg"
                             );
+                            self.log_sniper_decision(
+                                "side_in_flight",
+                                Some(format!("blocked_side={side_name}")),
+                                Some(2),
+                            );
                             continue;
                         }
                         reserved_keys.push(k);
@@ -534,6 +890,7 @@ impl Sniper {
                     }
                     if plans_res.is_empty() {
                         self.strategy_status.insert(status_key.clone(), "Snp: Waiting".to_string());
+                        self.log_sniper_decision("all_sides_in_flight", None, Some(2));
                         continue;
                     }
                     let plans = plans_res;
@@ -624,6 +981,15 @@ impl Sniper {
                         self.clear_pending_keys(&reserved_keys);
                         self.strategy_status
                             .insert(status_key.clone(), "Snp: Capped".to_string());
+                        self.log_sniper_decision(
+                            "fill_cap",
+                            Some(format!(
+                                "filled={} max={} (post-reserve)",
+                                filled_count,
+                                self.max_primary_fills_per_round()
+                            )),
+                            Some(2),
+                        );
                         continue;
                     }
 
@@ -653,8 +1019,12 @@ impl Sniper {
                         Err(e) => {
                             self.clear_pending_keys(&reserved_keys);
                             self.strategy_status.insert(status_key.clone(), "Snp: Can't afford".to_string());
+                            self.log_sniper_decision(
+                                "sizing_failed",
+                                Some(format!("{e:#}")),
+                                None,
+                            );
                             warn!(market = %self.market.slug, error = %e, "Cannot size sniper leg(s)");
-                            // Wait for next price event (event-driven, no polling delay)
                             continue;
                         }
                     };
@@ -665,6 +1035,14 @@ impl Sniper {
                         let sz = Decimal::from_str(&sz_str).unwrap_or(*sz);
                         if sz < self.config.sniper_min_shares {
                             self.strategy_status.insert(status_key.clone(), "Snp: Too small".to_string());
+                            self.log_sniper_decision(
+                                "order_below_min_shares",
+                                Some(format!(
+                                    "leg={i} size={sz} min={}",
+                                    self.config.sniper_min_shares
+                                )),
+                                None,
+                            );
                             warn!(
                                 market = %self.market.slug,
                                 leg_index = i,
@@ -672,7 +1050,6 @@ impl Sniper {
                                 min_shares = %self.config.sniper_min_shares,
                                 "Order size below configured minimum"
                             );
-                            // Wait for next price event (event-driven, no polling delay)
                             ok_sizes.clear();
                             break;
                         }
@@ -680,17 +1057,115 @@ impl Sniper {
                     }
                     if ok_sizes.len() != plans.len() {
                         self.clear_pending_keys(&reserved_keys);
+                        self.log_sniper_decision(
+                            "sizing_mismatch",
+                            Some(format!(
+                                "ok_sizes={} plans={}",
+                                ok_sizes.len(),
+                                plans.len()
+                            )),
+                            None,
+                        );
                         continue;
                     }
 
-                    // Last gate before place: momentum reversal (Binance vs round open). Dual: abort all if any leg blocks.
+                    // Entry quality gate (PM ask + Binance vs round open + time remaining). Dual: abort all if any leg blocks.
+                    let mut entry_quality_blocks: Vec<EntryQualityBlocked> = Vec::new();
+                    for (side_name, token_id, best_ask, _) in &plans {
+                        let pm_bid = self
+                            .orderbook
+                            .get_orderbook(token_id)
+                            .as_ref()
+                            .and_then(|o| o.best_bid())
+                            .and_then(|d| d.to_f64())
+                            .unwrap_or(0.0);
+                        if let Some(b) = self.entry_quality_eval(side_name, *best_ask, pm_bid) {
+                            entry_quality_blocks.push(b);
+                        }
+                    }
+                    if !entry_quality_blocks.is_empty() {
+                        if self.decision_throttle_try_acquire("entry_quality_block", 5) {
+                            for b in &entry_quality_blocks {
+                                info!(
+                                    coin = ?self.market.coin,
+                                    side = %b.side,
+                                    pm_ask = b.pm_ask,
+                                    distance_pct = %b.distance_pct,
+                                    required = %b.required,
+                                    time_remaining = b.time_remaining,
+                                    "Entry quality: BLOCKED"
+                                );
+                            }
+                            let combined = entry_quality_blocks
+                                .iter()
+                                .map(|b| b.detail.as_str())
+                                .collect::<Vec<_>>()
+                                .join(" | ");
+                            self.log_sniper_decision(
+                                "entry_quality_block",
+                                Some(combined),
+                                None,
+                            );
+                        }
+                        self.strategy_status
+                            .insert(status_key.clone(), "Snp: Entry quality".to_string());
+                        self.clear_pending_keys(&reserved_keys);
+                        continue;
+                    }
+
+                    // Spot slope gate: block if Binance spot trend in the last ~30s is against the entry side. Dual: abort all if any leg blocks.
+                    let mut slope_block_details: Vec<(String, String)> = Vec::new();
+                    for (side_name, _, _, _) in &plans {
+                        if let Some(detail) = self.spot_slope_blocks_entry(side_name) {
+                            slope_block_details.push((side_name.clone(), detail));
+                        }
+                    }
+                    if !slope_block_details.is_empty() {
+                        if self.decision_throttle_try_acquire("spot_slope_block", 5) {
+                            for (side_name, detail) in &slope_block_details {
+                                let side_label = if side_name == "YES" { "UP" } else { "DOWN" };
+                                info!(
+                                    coin = ?self.market.coin,
+                                    side = %side_label,
+                                    detail = %detail,
+                                    threshold = SLOPE_AGAINST_THRESHOLD,
+                                    "Spot slope filter: BLOCKED — price trending against entry"
+                                );
+                            }
+                            let combined = slope_block_details
+                                .iter()
+                                .map(|(_, d)| d.as_str())
+                                .collect::<Vec<_>>()
+                                .join(" | ");
+                            self.log_sniper_decision("spot_slope_block", Some(combined), None);
+                        }
+                        self.strategy_status
+                            .insert(status_key.clone(), "Snp: Spot slope".to_string());
+                        self.clear_pending_keys(&reserved_keys);
+                        continue;
+                    }
+
+                    // Momentum reversal gate (Binance vs round open). Dual: abort all if any leg blocks.
                     if plans.len() == 2 {
                         let d1 = self.momentum_reversal_block_detail(&plans[0].0);
                         let d2 = self.momentum_reversal_block_detail(&plans[1].0);
-                        if let Some(detail) = d1.or(d2) {
+                        if d1.is_some() || d2.is_some() {
+                            let detail = match (d1, d2) {
+                                (Some(a), Some(b)) => Some(format!("{a} | {b}")),
+                                (Some(a), None) => Some(a),
+                                (None, Some(b)) => Some(b),
+                                _ => None,
+                            };
+                            self.log_sniper_decision(
+                                "momentum_reversal_block",
+                                detail.clone(),
+                                None,
+                            );
+                            self.strategy_status
+                                .insert(status_key.clone(), "Snp: Mom reversal".to_string());
                             self.momentum_blocks.fetch_add(1, Ordering::Relaxed);
                             if let Ok(mut g) = self.last_momentum_block.lock() {
-                                *g = Some(detail);
+                                *g = detail;
                             }
                             self.clear_pending_keys(&reserved_keys);
                             continue;
@@ -698,6 +1173,13 @@ impl Sniper {
                     } else if let Some(detail) =
                         self.momentum_reversal_block_detail(&plans[0].0)
                     {
+                        self.log_sniper_decision(
+                            "momentum_reversal_block",
+                            Some(detail.clone()),
+                            None,
+                        );
+                        self.strategy_status
+                            .insert(status_key.clone(), "Snp: Mom reversal".to_string());
                         self.momentum_blocks.fetch_add(1, Ordering::Relaxed);
                         if let Ok(mut g) = self.last_momentum_block.lock() {
                             *g = Some(detail);
@@ -716,25 +1198,23 @@ impl Sniper {
                         match &sizing_plan {
                             SniperSizingPlan::Single(s) => {
                                 info!(
-                                    "SIZING: balance={}, deploy_pct={}, price={}, calc_shares={}, min_shares={}, max_shares={}, final_shares={}",
+                                    "SIZING: balance={}, deploy_pct={}, price={}, calc_shares={}, min_shares={}, final_shares={}",
                                     s.balance,
                                     s.deploy_pct,
                                     s.price,
                                     s.calc_shares,
                                     s.min_shares,
-                                    s.max_shares,
                                     order_size,
                                 );
                             }
                             SniperSizingPlan::Dual(d) => {
                                 info!(
-                                    "SIZING: balance={}, deploy_pct={}, price={}, calc_shares={}, min_shares={}, max_shares={}, final_shares={}",
+                                    "SIZING: balance={}, deploy_pct={}, sum_px={}, calc_per_leg={}, min_shares={}, final_per_leg={}",
                                     d.balance,
                                     d.deploy_pct,
                                     d.sum_px,
                                     d.calc_per_leg,
                                     d.min_shares,
-                                    d.max_per_leg,
                                     order_size,
                                 );
                             }
@@ -827,6 +1307,7 @@ impl Sniper {
                     }
 
                     if let Some(e) = place_err {
+                        self.log_sniper_decision("place_order_failed", Some(format!("{e:#}")), None);
                         for k in &reserved_keys {
                             self.pending_sniper_entries.remove(k);
                         }
@@ -871,11 +1352,14 @@ impl Sniper {
                     active_legs = placed;
                     self.strategy_status.insert(status_key.clone(), "Snp: Live".to_string());
 
+                    // Does not return to `tokio::select!` above until this loop exits — `fallback_interval`
+                    // and price-event wakeups do not apply while polling resting GTC status.
                     'poll: loop {
                         if shutdown.is_cancelled() {
                             break 'poll;
                         }
 
+                        let poll_iter_start = Instant::now();
                         let now = Utc::now().timestamp();
                         let tr = self.market.round_end - now;
                         let dual_poll = active_legs.len() >= 2;
@@ -963,20 +1447,6 @@ impl Sniper {
                                             None,
                                             false, // single-leg primary
                                         ) {
-                                            let entry_id = format!(
-                                                "{}:{}",
-                                                self.market.condition_id, leg.order_id
-                                            );
-                                            if let Some(h) = self.place_hedge_at_one_cent(
-                                                dual_poll,
-                                                &leg.side_name,
-                                                leg.maker_price,
-                                                size_matched,
-                                                leg.order_size,
-                                                &entry_id,
-                                            ).await {
-                                                pending_hedge = Some(h);
-                                            }
                                             // Increment global filled count
                                             let new_count = self.gtc_filled_count.fetch_add(1, Ordering::Relaxed) + 1;
                                             let max_f = self.max_primary_fills_per_round();
@@ -1078,23 +1548,7 @@ impl Sniper {
                                             self.remove_pending_side(&leg.side_name);
                                             self.active_gtc_orders.remove(&leg.order_id);
                                         }
-                                    } else if let Some((sz, recorded_new)) = matched_sz {
-                                        if recorded_new {
-                                            let entry_id = format!(
-                                                "{}:{}",
-                                                self.market.condition_id, leg.order_id
-                                            );
-                                            if let Some(h) = self.place_hedge_at_one_cent(
-                                                dual_poll,
-                                                &leg.side_name,
-                                                leg.maker_price,
-                                                sz,
-                                                leg.order_size,
-                                                &entry_id,
-                                            ).await {
-                                                pending_hedge = Some(h);
-                                            }
-                                        }
+                                    } else if let Some(_matched_sz) = matched_sz {
                                         let new_count = self.gtc_filled_count.fetch_add(1, Ordering::Relaxed) + 1;
                                         let max_f = self.max_primary_fills_per_round();
                                         if new_count >= max_f {
@@ -1174,14 +1628,24 @@ impl Sniper {
                         }
 
                         sleep(Duration::from_secs(1)).await;
+                        let poll_dur = poll_iter_start.elapsed();
+                        if poll_dur > Duration::from_secs(2) {
+                            let tr_now = (self.market.round_end - Utc::now().timestamp()).max(0);
+                            warn!(
+                                market = %self.market.slug,
+                                poll_iter_ms = poll_dur.as_millis(),
+                                time_remaining_secs = tr_now,
+                                "sniper poll iteration slow (get_order_status / cancel / reconcile)"
+                            );
+                        }
                     }
                 }
                 Ok(None) => {
-                    // Gates not passed, wait
-                    self.strategy_status.insert(status_key.clone(), "Snp: Waiting".to_string());
+                    // Status set inside `evaluate_entry_gates_with_orderbooks` (ask sum / threshold).
                 }
                 Err(e) => {
                     self.strategy_status.insert(status_key.clone(), "Snp: Error".to_string());
+                    self.log_sniper_decision("gate_eval_error", Some(format!("{e:#}")), Some(1));
                     error!(market = %self.market.slug, error = %e, "Error evaluating entry gates");
                     let t_err = Instant::now();
                     info!(
@@ -1204,9 +1668,6 @@ impl Sniper {
                 for leg in &active_legs {
                     self.active_gtc_orders.remove(&leg.order_id);
                 }
-                if let Some(h) = pending_hedge.take() {
-                    self.cancel_resting_hedge_order(h, &status_key, "round ended").await;
-                }
                 break;
             }
 
@@ -1222,320 +1683,6 @@ impl Sniper {
             &self.market.condition_id,
         );
         Ok(())
-    }
-
-    /// Place GTC hedge at $0.01 immediately after primary fill. No orderbook watching.
-    /// Skip if entry_price >= 0.99, or entry_price + 0.01 > SNIPER_HEDGE_MAX_PAIR_COST.
-    async fn place_hedge_at_one_cent(
-        &self,
-        dual_poll: bool,
-        side_name: &str,
-        entry_price: Decimal,
-        size_matched: Decimal,
-        sniper_order_shares: Decimal,
-        round_history_id: &str,
-    ) -> Option<ActiveHedgeOrder> {
-        if dual_poll {
-            return None;
-        }
-        if self.config.sniper_hedge_max_pair_cost >= dec!(1.0) {
-            return None;
-        }
-        if entry_price >= dec!(0.99) {
-            return None; // pair cost would be $1.00+ = no profit
-        }
-        if entry_price + dec!(0.01) > self.config.sniper_hedge_max_pair_cost {
-            return None;
-        }
-        let target = size_matched.min(sniper_order_shares).round_dp(2);
-        if target <= Decimal::ZERO {
-            return None;
-        }
-
-        let (other_token_id, hedge_side) = if side_name == "YES" {
-            (self.market.down_token_id.clone(), "NO".to_string())
-        } else {
-            (self.market.up_token_id.clone(), "YES".to_string())
-        };
-
-        let hedge_price = dec!(0.01);
-        let tick = self.market.minimum_tick_size;
-        let est_cost = (target * hedge_price).round_dp(2);
-        let balance = *self.balance_receiver.borrow();
-        if est_cost > balance {
-            warn!(
-                market = %self.market.slug,
-                est_cost = %est_cost,
-                balance = %balance,
-                "Sniper hedge skipped — insufficient balance"
-            );
-            return None;
-        }
-
-        let resp = match self
-            .execution
-            .place_limit_order(
-                other_token_id.as_str(),
-                Side::Buy,
-                hedge_price,
-                target,
-                tick,
-                OrderType::GTC,
-            )
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(
-                    market = %self.market.slug,
-                    error = %e,
-                    "Sniper hedge GTC @ $0.01 post failed"
-                );
-                return None;
-            }
-        };
-
-        if !resp.success {
-            warn!(
-                market = %self.market.slug,
-                "Sniper hedge GTC @ $0.01 rejected"
-            );
-            return None;
-        }
-
-        let oid = resp.order_id.clone();
-        info!(
-            market = %self.market.slug,
-            hedge_side = %hedge_side,
-            order_id = %oid,
-            size = %target,
-            "Sniper hedge GTC placed @ $0.01"
-        );
-        if let Some(ref tx) = self.tui_tx {
-            let side_display = if hedge_side == "YES" { "UP" } else { "DOWN" };
-            let t = Local::now().format("%H:%M:%S").to_string();
-            let log_msg = format!(
-                "{} {} {} {} hedge GTC PLACED {}@{}",
-                t,
-                self.market.coin.as_str(),
-                format!("{}m", self.market.period.as_minutes()),
-                side_display,
-                target,
-                hedge_price
-            );
-            let _ = tx.try_send(TuiEvent::TradeLog(log_msg));
-        }
-        self.active_gtc_orders.insert(
-            oid.clone(),
-            (
-                self.execution.clone(),
-                self.market.slug.clone(),
-                self.market.period,
-                self.market.round_start,
-            ),
-        );
-        let status_key = strategy_status_key(self.market.coin, self.market.period, self.market.round_start, "sniper");
-        self.strategy_status
-            .insert(status_key, "Snp: Hedge live".to_string());
-
-        Some(ActiveHedgeOrder {
-            order_id: oid,
-            round_history_id: round_history_id.to_string(),
-            sniper_fill_price: entry_price,
-            hedge_side,
-            order_size: target,
-            limit_price: hedge_price,
-            next_poll_at: Instant::now(),
-        })
-    }
-
-    /// Poll resting hedge GTC (~1s cadence); cancel near round end. Returns true if done (clear pending).
-    async fn poll_sniper_hedge(
-        &self,
-        hedge: &mut ActiveHedgeOrder,
-        status_key: &str,
-        time_remaining: i64,
-    ) -> bool {
-        // Final seconds: cancel immediately
-        if time_remaining <= 5 {
-            info!(
-                market = %self.market.slug,
-                time_remaining,
-                "Sniper hedge: cancelling unfilled GTC (final seconds of round)"
-            );
-            let oid = hedge.order_id.clone();
-            let lp = hedge.limit_price;
-            let _ = self.execution.cancel_order(&oid).await;
-            self.active_gtc_orders.remove(&oid);
-            let _ = self
-                .reconcile_late_fill(
-                    &oid,
-                    &hedge.hedge_side,
-                    lp,
-                    status_key,
-                    None,
-                    Some(hedge.round_history_id.as_str()),
-                    false,
-                )
-                .await;
-            self.strategy_status
-                .insert(status_key.to_string(), "Snp: Hedge cx'd (round)".to_string());
-            return true;
-        }
-
-        if Instant::now() < hedge.next_poll_at {
-            return false;
-        }
-        hedge.next_poll_at = Instant::now() + Duration::from_secs(1);
-
-        let oid = hedge.order_id.clone();
-        let lp = hedge.limit_price;
-        let osz = hedge.order_size;
-
-        match self.execution.get_order_status(&oid).await {
-            Ok(Some((status, size_matched))) => {
-                let st = status.to_lowercase();
-
-                if Self::order_fully_filled(&status, size_matched, osz) {
-                    if self.record_sniper_fill_if_new(
-                        &oid,
-                        &hedge.hedge_side,
-                        lp,
-                        size_matched,
-                        status_key,
-                        Some(hedge.round_history_id.as_str()),
-                        false,
-                    ) {
-                        self.log_hedge_pair_locked(hedge, lp, size_matched);
-                    }
-                    self.active_gtc_orders.remove(&oid);
-                    self.strategy_status
-                        .insert(status_key.to_string(), "Snp: Hedged".to_string());
-                    return true;
-                }
-
-                if Self::order_status_indicates_fill(&status, size_matched) && size_matched < osz {
-                    return false; // Partial — keep polling
-                }
-
-                if st == "cancelled" {
-                    let matched_sz = self
-                        .reconcile_late_fill(
-                            &oid,
-                            &hedge.hedge_side,
-                            lp,
-                            status_key,
-                            None,
-                            Some(hedge.round_history_id.as_str()),
-                            false,
-                        )
-                        .await;
-                    self.active_gtc_orders.remove(&oid);
-                    if matched_sz.is_none() {
-                        self.strategy_status
-                            .insert(status_key.to_string(), "Snp: Hedge cancelled".to_string());
-                    }
-                    return true;
-                }
-            }
-            Ok(None) => {
-                let matched_sz = self
-                    .reconcile_late_fill(
-                        &oid,
-                        &hedge.hedge_side,
-                        lp,
-                        status_key,
-                        Some(osz),
-                        Some(hedge.round_history_id.as_str()),
-                        false,
-                    )
-                    .await;
-                if let Some((sz, recorded)) = matched_sz {
-                    if recorded {
-                        self.log_hedge_pair_locked(hedge, lp, sz);
-                    }
-                    self.active_gtc_orders.remove(&oid);
-                    self.strategy_status
-                        .insert(status_key.to_string(), "Snp: Hedged".to_string());
-                    return true;
-                }
-            }
-            Err(e) => {
-                warn!(
-                    market = %self.market.slug,
-                    order_id = %oid,
-                    error = %e,
-                    "Sniper hedge: get_order_status error, will retry"
-                );
-            }
-        }
-        false
-    }
-
-    fn log_hedge_pair_locked(
-        &self,
-        hedge: &ActiveHedgeOrder,
-        hedge_avg: Decimal,
-        hedge_shares: Decimal,
-    ) {
-        let locked_pair = hedge.sniper_fill_price + hedge_avg;
-        let profit_per_share = (Decimal::ONE - locked_pair).max(Decimal::ZERO);
-        info!(
-            market = %self.market.slug,
-            hedge_side = %hedge.hedge_side,
-            sniper_fill_price = %hedge.sniper_fill_price,
-            hedge_avg_fill = %hedge_avg,
-            locked_pair_cost = %locked_pair,
-            profit_per_share = %profit_per_share,
-            hedge_shares = %hedge_shares,
-            "Sniper hedge GTC filled — locked pair cost and profit"
-        );
-
-        if let Some(ref tx) = self.tui_tx {
-            let side_display = if hedge.hedge_side == "YES" { "UP" } else { "DOWN" };
-            let fill_time = Local::now().format("%H:%M:%S").to_string();
-            let log_msg = format!(
-                "{} {} {} {} hedge {}@{} GTC | pair {} profit/sh {}",
-                fill_time,
-                self.market.coin.as_str(),
-                format!("{}m", self.market.period.as_minutes()),
-                side_display,
-                hedge_shares,
-                hedge_avg,
-                locked_pair,
-                profit_per_share
-            );
-            let _ = tx.try_send(TuiEvent::TradeLog(log_msg));
-        }
-    }
-
-    async fn cancel_resting_hedge_order(
-        &self,
-        hedge: ActiveHedgeOrder,
-        status_key: &str,
-        reason: &str,
-    ) {
-        info!(
-            market = %self.market.slug,
-            order_id = %hedge.order_id,
-            reason = %reason,
-            "Cancelling resting sniper hedge GTC"
-        );
-        let _ = self.execution.cancel_order(&hedge.order_id).await;
-        self.active_gtc_orders.remove(&hedge.order_id);
-        let _ = self
-            .reconcile_late_fill(
-                &hedge.order_id,
-                &hedge.hedge_side,
-                hedge.limit_price,
-                status_key,
-                None,
-                Some(hedge.round_history_id.as_str()),
-                false,
-            )
-            .await;
-        self.strategy_status
-            .insert(status_key.to_string(), "Snp: Hedge cx'd".to_string());
     }
 
     /// True if the CLOB reports a non-zero matched size. Do not infer fills from status alone:
@@ -1846,13 +1993,15 @@ impl Sniper {
             .get_orderbook(&self.market.down_token_id)
             .context("No NO orderbook data")?;
         
-        self.evaluate_entry_gates_with_orderbooks(Some(yes_orderbook), Some(no_orderbook)).await
+        self.evaluate_entry_gates_with_orderbooks(Some(yes_orderbook), Some(no_orderbook), None)
+            .await
     }
 
     async fn evaluate_entry_gates_with_orderbooks(
         &self,
         yes_orderbook_opt: Option<OrderbookState>,
         no_orderbook_opt: Option<OrderbookState>,
+        status_key: Option<&str>,
     ) -> Result<Option<Vec<(String, String, Decimal)>>> {
         let yes_orderbook = yes_orderbook_opt.context("No YES orderbook data")?;
         let no_orderbook = no_orderbook_opt.context("No NO orderbook data")?;
@@ -1878,6 +2027,15 @@ impl Sniper {
                     "Orderbook sanity check FAILED: yes_ask={} + no_ask={} = {}. Skipping.",
                     yes_ask, no_ask, sum
                 );
+                self.log_sniper_decision(
+                    "orderbook_sanity",
+                    Some(format!("yes_ask={yes_ask} no_ask={no_ask} sum={sum}")),
+                    Some(3),
+                );
+                if let Some(k) = status_key {
+                    self.strategy_status
+                        .insert(k.to_string(), "Snp: Ask sum bad".to_string());
+                }
                 return Ok(None);
             }
         }
@@ -1896,6 +2054,21 @@ impl Sniper {
         }
 
         if sides.is_empty() {
+            self.log_sniper_decision(
+                "no_side_above_threshold",
+                Some(format!(
+                    "yes_ask={yes_best_ask:?} no_ask={no_best_ask:?} min_best_ask={threshold}"
+                )),
+                Some(3),
+            );
+            if let Some(k) = status_key {
+                let msg = if yes_best_ask.is_none() && no_best_ask.is_none() {
+                    "Snp: No asks"
+                } else {
+                    "Snp: Ask < entry min"
+                };
+                self.strategy_status.insert(k.to_string(), msg.to_string());
+            }
             Ok(None)
         } else {
             Ok(Some(sides))
@@ -1903,8 +2076,7 @@ impl Sniper {
     }
 
     /// Per-leg size when resting GTC on both YES and NO: deploy `balance * capital_deploy_pct`
-    /// across the pair (`per * (p_yes + p_no)`), with `per = max(floor(budget/sum_px), min_shares)`,
-    /// capped at half `SNIPER_MAX_SHARES`.
+    /// across the pair (`per * (p_yes + p_no)`), with `per = max(floor(budget/sum_px), min_shares)`.
     fn calculate_per_leg_size_dual(
         &self,
         maker_yes: Decimal,
@@ -1914,31 +2086,33 @@ impl Sniper {
             *self.balance_receiver.borrow(),
             maker_yes,
             maker_no,
-            self.config.sniper_max_shares,
             self.config.sniper_capital_deploy_pct,
             self.config.sniper_min_shares,
         )
     }
 
-    /// `max(floor(balance * capital_deploy_pct / price), min_shares)`, capped at `SNIPER_MAX_SHARES`.
+    /// `max(floor(balance * capital_deploy_pct / price), min_shares)` (default: 1% or `SNIPER_MIN_SHARES`, whichever yields more shares).
     fn compute_single_leg_sizing(&self, price: Decimal) -> Result<SingleLegSizing> {
         strategy_sizing::compute_single_leg_sizing(
             *self.balance_receiver.borrow(),
             price,
-            self.config.sniper_max_shares,
             self.config.sniper_capital_deploy_pct,
             self.config.sniper_min_shares,
         )
     }
 
-    /// Cancel all resting sniper-tracked GTC orders for this `(Period, round_start)` (all coins).
+    /// Cancel resting sniper-tracked GTC orders for **this** market and round (same slug / period / round_start).
     async fn cancel_all_remaining_gtc_orders(&self) {
         let period = self.market.period;
         let round_start = self.market.round_start;
+        let slug = self.market.slug.clone();
         let order_ids: Vec<String> = self
             .active_gtc_orders
             .iter()
-            .filter(|e| e.value().2 == period && e.value().3 == round_start)
+            .filter(|e| {
+                let v = e.value();
+                v.1 == slug && v.2 == period && v.3 == round_start
+            })
             .map(|e| e.key().clone())
             .collect();
 

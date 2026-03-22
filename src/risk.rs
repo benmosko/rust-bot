@@ -18,8 +18,6 @@ pub struct RiskManager {
     sniper_paused_until: Arc<RwLock<Option<DateTime<Utc>>>>,
     volatility_paused_until: Arc<RwLock<Option<DateTime<Utc>>>>,
     #[allow(dead_code)]
-    active_rounds: Arc<RwLock<usize>>,
-    #[allow(dead_code)]
     recent_spot_changes: Arc<RwLock<VecDeque<(Decimal, DateTime<Utc>)>>>,
 }
 
@@ -32,28 +30,7 @@ impl RiskManager {
             consecutive_sniper_losses: Arc::new(RwLock::new(0)),
             sniper_paused_until: Arc::new(RwLock::new(None)),
             volatility_paused_until: Arc::new(RwLock::new(None)),
-            active_rounds: Arc::new(RwLock::new(0)),
             recent_spot_changes: Arc::new(RwLock::new(VecDeque::new())),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub async fn can_open_new_round(&self) -> bool {
-        let active = *self.active_rounds.read().await;
-        active < self.config.max_concurrent_rounds
-    }
-
-    #[allow(dead_code)]
-    pub async fn increment_active_rounds(&self) {
-        let mut active = self.active_rounds.write().await;
-        *active += 1;
-    }
-
-    #[allow(dead_code)]
-    pub async fn decrement_active_rounds(&self) {
-        let mut active = self.active_rounds.write().await;
-        if *active > 0 {
-            *active -= 1;
         }
     }
 

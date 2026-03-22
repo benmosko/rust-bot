@@ -19,25 +19,23 @@ use polymarket_bot::types::{
     BotState, Coin, Market, Period, Round, RoundHistoryEntry, SniperEntryKey, TuiEvent,
     strategy_status_key,
 };
+use polymarket_bot::telegram_webapp::{abbrev_strategy_line, format_round_time_range_utc, LiveRoundRow};
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 
-/// YES/NO for TUI: always use live orderbook best_ask (entry price). Fallback to Gamma snapshot only if
-/// orderbook is completely empty (shouldn't happen after subscription, but protects against WS delays).
+/// YES/NO for TUI: **same field the sniper uses** — live CLOB `best_ask` only (what you pay to buy each outcome).
+/// Do not fall back to bid or Gamma: bids/Gamma can look like a "fine" book (e.g. $0.01 / $0.99) while the
+/// sniper correctly stays on `Snp: Waiting` because asks are missing or fail the ask-sum sanity check.
 fn round_yes_no_display_prices(orderbook: &OrderbookManager, market: &Market) -> (Decimal, Decimal) {
     let yes_ob = orderbook.get_orderbook(&market.up_token_id);
     let no_ob = orderbook.get_orderbook(&market.down_token_id);
-    // Prefer best_ask (entry price) over best_bid for YES/NO markets
     let yes = yes_ob
         .as_ref()
-        .and_then(|o| o.best_ask().or_else(|| o.best_bid()))
-        .or(market.up_best_ask)
-        .or(market.up_best_bid)
+        .and_then(|o| o.best_ask())
         .unwrap_or(Decimal::ZERO);
     let no = no_ob
         .as_ref()
-        .and_then(|o| o.best_ask().or_else(|| o.best_bid()))
-        .or(market.down_best_ask)
-        .or(market.down_best_bid)
+        .and_then(|o| o.best_ask())
         .unwrap_or(Decimal::ZERO);
     (yes, no)
 }
@@ -425,8 +423,8 @@ async fn main() -> Result<()> {
     let strategy_status: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
     let strategy_status_for_tui = strategy_status.clone();
 
-    // Shared primary sniper fill count per `(Period, round_start)` — all coins in that slot share one counter.
-    let gtc_filled_by_round: Arc<DashMap<(Period, i64), Arc<AtomicU32>>> = Arc::new(DashMap::new());
+    // Primary sniper fill count per market `(coin, period, round_start)` — each coin has its own cap (`SNIPER_MAX_FILLS_PER_ROUND`).
+    let gtc_filled_by_round: Arc<DashMap<(Coin, Period, i64), Arc<AtomicU32>>> = Arc::new(DashMap::new());
     // order_id -> (execution, slug, period, round_start) for cross-market cancel on fill cap
     let active_gtc_orders: Arc<
         DashMap<String, (Arc<polymarket_bot::execution::ExecutionEngine>, String, Period, i64)>,
@@ -469,6 +467,9 @@ async fn main() -> Result<()> {
         polymarket_bot::config::StrategyMode::All => "all",
     };
 
+    let live_dashboard_rounds: Arc<Mutex<Vec<polymarket_bot::telegram_webapp::LiveRoundRow>>> =
+        Arc::new(Mutex::new(Vec::new()));
+
     let telegram_dashboard = polymarket_bot::telegram::TelegramDashboardState::default();
     let telegram = Arc::new(polymarket_bot::telegram::TelegramBot::new(
         telegram_dashboard.clone(),
@@ -489,6 +490,7 @@ async fn main() -> Result<()> {
                         dry_run.clone(),
                         balance.clone(),
                         strategy_status.clone(),
+                        live_dashboard_rounds.clone(),
                         session_start,
                         start_balance,
                         strategy_mode_str.to_string(),
@@ -565,6 +567,8 @@ async fn main() -> Result<()> {
 
         // Phase 1: push TUI updates for every configured slot first. Sequential Gamma fetches used to
         // block the whole loop; one slow market froze prices for all others.
+        // Same snapshot feeds the Telegram Mini App dashboard (`live_dashboard_rounds`).
+        let mut live_rows: Vec<LiveRoundRow> = Vec::with_capacity(market_slots.len());
         for &(coin, period) in &market_slots {
             let period_secs = period.as_seconds();
             let round_start = (now / period_secs) * period_secs;
@@ -610,6 +614,28 @@ async fn main() -> Result<()> {
                 (rust_decimal::Decimal::ZERO, rust_decimal::Decimal::ZERO, "Waiting".to_string())
             };
 
+            let status_str = if now >= round_end {
+                "Ended".to_string()
+            } else if active_rounds.contains_key(&round_key) {
+                "Active".to_string()
+            } else {
+                "Waiting".to_string()
+            };
+
+            live_rows.push(LiveRoundRow {
+                coin: coin.as_str().to_uppercase(),
+                period: format!("{}m", period.as_minutes()),
+                market_label: format!("{} {}m", coin.as_str().to_uppercase(), period.as_minutes()),
+                round_start,
+                round_end,
+                round_time_range_utc: format_round_time_range_utc(round_start, round_end),
+                elapsed_pct,
+                yes_ask: yes_price.to_f64().unwrap_or(0.0),
+                no_ask: no_price.to_f64().unwrap_or(0.0),
+                strategy: abbrev_strategy_line(&strategy_str),
+                status: status_str.clone(),
+            });
+
             if let Some(ref tui_tx) = tui_tx_rounds {
                 let _ = tui_tx.try_send(TuiEvent::RoundUpdate {
                     coin,
@@ -619,15 +645,12 @@ async fn main() -> Result<()> {
                     yes_price,
                     no_price,
                     strategy: strategy_str,
-                    status: if now >= round_end {
-                        "Ended".to_string()
-                    } else if active_rounds.contains_key(&round_key) {
-                        "Active".to_string()
-                    } else {
-                        "Waiting".to_string()
-                    },
+                    status: status_str,
                 });
             }
+        }
+        if let Ok(mut g) = live_dashboard_rounds.lock() {
+            *g = live_rows;
         }
 
         // Phase 2: parallel Gamma discovery for slots missing the current round
@@ -642,6 +665,7 @@ async fn main() -> Result<()> {
         }
 
         if !fetch_jobs.is_empty() {
+            let fetch_concurrency = fetch_jobs.len().max(1);
             let http = gamma_http.clone();
             let pb = prefetch_buffer.clone();
             let results: Vec<_> = stream::iter(fetch_jobs)
@@ -668,7 +692,7 @@ async fn main() -> Result<()> {
                         (round_key, slug, fetch_result)
                     }
                 })
-                .buffer_unordered(8)
+                .buffer_unordered(fetch_concurrency)
                 .collect()
                 .await;
 
@@ -733,7 +757,7 @@ async fn main() -> Result<()> {
                                     let sniper_status = strategy_status.clone();
                                     let sniper_balance_receiver = balance_receiver.clone();
                                     let sniper_gtc_filled_count = gtc_filled_by_round
-                                        .entry((period, round_start))
+                                        .entry((coin, period, round_start))
                                         .or_insert_with(|| Arc::new(AtomicU32::new(0)))
                                         .clone();
                                     let sniper_active_gtc_orders = active_gtc_orders.clone();
@@ -934,7 +958,7 @@ async fn main() -> Result<()> {
                                     let sniper_status = strategy_status.clone();
                                     let sniper_balance_receiver = balance_receiver.clone();
                                     let sniper_gtc_filled_count = gtc_filled_by_round
-                                        .entry((period, round_start))
+                                        .entry((coin, period, round_start))
                                         .or_insert_with(|| Arc::new(AtomicU32::new(0)))
                                         .clone();
                                     let sniper_active_gtc_orders = active_gtc_orders.clone();
@@ -1062,7 +1086,7 @@ async fn main() -> Result<()> {
                     let slug = round.market.slug.clone();
                     let condition_id = round.market.condition_id.clone();
 
-                    gtc_filled_by_round.remove(&(period, round_to_cleanup_start));
+                    gtc_filled_by_round.remove(&(coin, period, round_to_cleanup_start));
 
                     clear_sniper_pending_for_market(
                         &pending_sniper_entries,

@@ -1,6 +1,7 @@
 //! HTTPS Mini App: positions countdown + live dashboard (initData validated server-side).
 
 use crate::types::{Coin, Period, RoundHistoryEntry, RoundHistoryStatus};
+use chrono::{TimeZone, Utc};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
@@ -38,6 +39,7 @@ struct MiniAppState {
     dry_run: Arc<AtomicBool>,
     balance_rx: watch::Receiver<rust_decimal::Decimal>,
     strategy_status: Arc<DashMap<String, String>>,
+    live_rounds: Arc<Mutex<Vec<LiveRoundRow>>>,
     session_start: chrono::DateTime<chrono::Utc>,
     #[allow(dead_code)]
     session_start_balance: rust_decimal::Decimal,
@@ -61,7 +63,42 @@ struct PositionRow {
     period: String,
     side: String,
     entry_price: f64,
+    /// Primary leg filled size (shares).
+    shares: f64,
+    round_start: i64,
     round_end: i64,
+    /// e.g. `12:30–12:35 UTC` for the round window.
+    round_time_range_utc: String,
+}
+
+/// One row per configured (coin, period) — same book prices and strategy line as the TUI Active Rounds table.
+#[derive(Clone, Serialize)]
+pub struct LiveRoundRow {
+    pub coin: String,
+    pub period: String,
+    /// e.g. `BTC 5m`
+    pub market_label: String,
+    pub round_start: i64,
+    pub round_end: i64,
+    pub round_time_range_utc: String,
+    /// 0.0–1.0 through the current round window.
+    pub elapsed_pct: f64,
+    pub yes_ask: f64,
+    pub no_ask: f64,
+    pub strategy: String,
+    pub status: String,
+}
+
+/// Shorten long sniper status strings for narrow layouts (matches TUI `abbrev_active_round_strategy`).
+pub fn abbrev_strategy_line(s: &str) -> String {
+    let t = s.trim();
+    let t = t.replace("Cap reached", "Capped");
+    let t = t.replace("Dual filled, rest cx'd", "Dual+cx");
+    if t.chars().count() > 32 {
+        t.chars().take(29).collect::<String>() + "…"
+    } else {
+        t
+    }
 }
 
 #[derive(Serialize)]
@@ -75,6 +112,7 @@ struct DashboardResponse {
     uptime_secs: u64,
     positions: Vec<PositionRow>,
     strategy_status: Vec<StatusRow>,
+    live_rounds: Vec<LiveRoundRow>,
 }
 
 #[derive(Serialize)]
@@ -93,6 +131,7 @@ pub fn spawn_http_server(
     dry_run: Arc<AtomicBool>,
     balance: Arc<crate::balance::BalanceManager>,
     strategy_status: Arc<DashMap<String, String>>,
+    live_rounds: Arc<Mutex<Vec<LiveRoundRow>>>,
     session_start: chrono::DateTime<chrono::Utc>,
     session_start_balance: rust_decimal::Decimal,
     strategy_mode: String,
@@ -106,6 +145,7 @@ pub fn spawn_http_server(
             dry_run,
             balance_rx: balance.receiver(),
             strategy_status,
+            live_rounds,
             session_start,
             session_start_balance,
             strategy_mode,
@@ -178,7 +218,10 @@ async fn positions_handler(
             period: period_display(e.period),
             side: e.side_label.clone(),
             entry_price: e.entry_price.to_f64().unwrap_or(0.0),
+            shares: e.shares.to_f64().unwrap_or(0.0),
+            round_start: e.round_start,
             round_end: e.round_end,
+            round_time_range_utc: format_round_time_range_utc(e.round_start, e.round_end),
         });
     }
     drop(guard);
@@ -239,14 +282,17 @@ async fn dashboard_handler(
             period: period_display(e.period),
             side: e.side_label.clone(),
             entry_price: e.entry_price.to_f64().unwrap_or(0.0),
+            shares: e.shares.to_f64().unwrap_or(0.0),
+            round_start: e.round_start,
             round_end: e.round_end,
+            round_time_range_utc: format_round_time_range_utc(e.round_start, e.round_end),
         });
     }
 
     let mut strategy_status: Vec<StatusRow> = Vec::new();
     for r in state.strategy_status.iter() {
         strategy_status.push(StatusRow {
-            key: r.key().clone(),
+            key: format_strategy_status_key_display(r.key()),
             value: r.value().clone(),
         });
     }
@@ -255,6 +301,12 @@ async fn dashboard_handler(
     let uptime_secs = (chrono::Utc::now() - state.session_start)
         .num_seconds()
         .max(0) as u64;
+
+    let live_rounds = state
+        .live_rounds
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default();
 
     Json(DashboardResponse {
         server_now,
@@ -266,6 +318,7 @@ async fn dashboard_handler(
         uptime_secs,
         positions,
         strategy_status,
+        live_rounds,
     })
     .into_response()
 }
@@ -276,6 +329,60 @@ fn coin_display(c: Coin) -> String {
 
 fn period_display(p: Period) -> String {
     format!("{}m", p.as_minutes())
+}
+
+/// `coin_periodMin_roundStart_strategy...` → `BTC 15m 12:30–12:45 UTC · sniper` (replaces raw epoch in the label).
+fn format_strategy_status_key_display(key: &str) -> String {
+    let parts: Vec<&str> = key.split('_').collect();
+    if parts.len() < 4 {
+        return key.to_string();
+    }
+    let coin = parts[0].to_uppercase();
+    let Ok(period_min) = parts[1].parse::<u64>() else {
+        return key.to_string();
+    };
+    let Ok(round_start) = parts[2].parse::<i64>() else {
+        return key.to_string();
+    };
+    let strategy = parts[3..].join("_");
+    let dur_secs = (period_min as i64) * 60;
+    let round_end = round_start + dur_secs;
+    let start = Utc.timestamp_opt(round_start, 0).single();
+    let end = Utc.timestamp_opt(round_end, 0).single();
+    match (start, end) {
+        (Some(s), Some(e)) => {
+            let range = if s.date_naive() == e.date_naive() {
+                format!("{}–{} UTC", s.format("%H:%M"), e.format("%H:%M"))
+            } else {
+                format!(
+                    "{} – {} UTC",
+                    s.format("%b %d %H:%M"),
+                    e.format("%b %d %H:%M")
+                )
+            };
+            format!("{} {}m {} · {}", coin, period_min, range, strategy)
+        }
+        _ => key.to_string(),
+    }
+}
+
+pub fn format_round_time_range_utc(round_start: i64, round_end: i64) -> String {
+    let start = Utc.timestamp_opt(round_start, 0).single();
+    let end = Utc.timestamp_opt(round_end, 0).single();
+    match (start, end) {
+        (Some(s), Some(e)) => {
+            if s.date_naive() == e.date_naive() {
+                format!("{}–{} UTC", s.format("%H:%M"), e.format("%H:%M"))
+            } else {
+                format!(
+                    "{} – {} UTC",
+                    s.format("%b %d %H:%M"),
+                    e.format("%b %d %H:%M")
+                )
+            }
+        }
+        _ => String::new(),
+    }
 }
 
 fn chat_id_matches(allowed: &str, user_id: i64) -> bool {

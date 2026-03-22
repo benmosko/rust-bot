@@ -54,7 +54,7 @@ main.rs
 | Shared | Type | Writers | Readers |
 |--------|------|---------|---------|
 | `round_history` | `Arc<Mutex<Vec<RoundHistoryEntry>>>` | sniper (push/update), market_discovery (resolve) | main, TUI, PnL logger |
-| `gtc_filled_by_round` | `DashMap<(Period,i64), AtomicU32>` | sniper on primary fill | sniper, main (cleanup) |
+| `gtc_filled_by_round` | `DashMap<(Coin,Period,i64), AtomicU32>` | sniper on primary fill (per market) | sniper, main (cleanup) |
 | `active_gtc_orders` | `DashMap<order_id, (Execution, slug, Period, round_start)>` | sniper (insert on place, remove on cancel/fill) | main (cancel on expiry) |
 | `trade_history` | `DashMap<order_id, FilledTrade>` | strategies on fill | (PnL/redemption reference) |
 | `strategy_status` | `DashMap<String, String>` | each strategy | main (TUI round display) |
